@@ -1,5 +1,19 @@
 workspace(name = "envpool")
 
+# --- pokemon-ai project addition (not upstream sail-sg/envpool) ---
+# Vendors ../ptcg_engine (repo-root sibling of this envpool/ submodule checkout) as
+# @ptcg_engine for the ptcg env family. See the envpool-ptcg-integration skill.
+# Kept as a single block, separate from the workspace0/workspace1 upstream dependency
+# lists below, so it's easy to re-identify and reapply after a submodule sync.
+load("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
+
+new_local_repository(
+    name = "ptcg_engine",
+    path = "../ptcg_engine",
+    build_file = "//third_party/ptcg_engine:ptcg_engine.BUILD",
+)
+# --- end pokemon-ai project addition ---
+
 load("//envpool:workspace0.bzl", workspace0 = "workspace")
 
 workspace0()
