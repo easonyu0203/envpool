@@ -19,7 +19,6 @@
 #include <array>
 #include <mutex>
 #include <numeric>
-#include <random>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -28,37 +27,10 @@
 
 #include "envpool/core/async_envpool.h"
 #include "envpool/core/env.h"
+#include "envpool/ptcg/ptcg_encode.h"
+#include "envpool/ptcg/ptcg_schema.h"
 
 namespace ptcg {
-
-// EncodedObservation shape constants, mirrored from
-// submissions/template_submission/schema.py:61-67. Keep in sync by hand --
-// there is no shared codegen between the Python and C++ sides (see the
-// envpool-ptcg-integration skill's "EncodedObservation schema" section).
-constexpr int kMaxCards = 120;
-constexpr int kMaxPokemon = 18;
-constexpr int kMaxOptions = 63;
-constexpr int kNCardIds = 1267;
-
-constexpr int kCardsCols = 5;
-constexpr int kPokemonsCols = 15;
-constexpr int kPlayerStateRows = 2;
-constexpr int kPlayerStateCols = 9;
-constexpr int kStateCols = 8;
-constexpr int kSelectCols = 16;
-constexpr int kOptionsCols = 19;
-
-// Deck-select and decide() share one action shape (see "Action space" in the
-// envpool-ptcg-integration skill): 60 slots, all real values (card ids) for
-// deck-select, up to maxCount real option-row indices + -1 padding for
-// decide().
-constexpr int kActionSlots = 60;
-
-static_assert(kActionSlots == DECK_SIZE,
-              "action space's 60 deck-select slots must equal the engine's "
-              "own deck size (ptcg_engine/Core.h's DECK_SIZE) -- deck-select "
-              "hands the action's slots to ApiBattleStart verbatim, see "
-              "'Action space' in the envpool-ptcg-integration skill");
 
 class PtcgEnvFns {
  public:
@@ -89,32 +61,48 @@ class PtcgEnvFns {
 
 using PtcgEnvSpec = EnvSpec<PtcgEnvFns>;
 
+// Phase 2.5 (envpool-ptcg-integration skill): two decision types the engine
+// can present that must never reach Python -- see "Trajectory & prompt
+// routing". Free functions (only need `state`, no PtcgEnv instance state),
+// mirroring tests/support/engine_harness.py's
+// is_forced_select/is_prize_select/is_bypassed_select -- an independent
+// mirror of the same checks in the same order, used as a cross-check while
+// writing this.
+inline bool IsForcedFullSelect(const State& state) {
+  return state.selectMin == state.selectMax &&
+         state.selectMax == static_cast<int>(state.options.size());
+}
+
+inline bool IsPrizeSelect(const State& state) {
+  return !state.options.empty() &&
+         state.options[0].getCardPosition().area == AreaType::Prize;
+}
+
+inline bool IsBypassedSelect(const State& state) {
+  return IsForcedFullSelect(state) || IsPrizeSelect(state);
+}
+
 /**
- * Phase 2 (envpool-ptcg-integration skill): real ptcg_engine calls.
- * Reset()/Step() drive the actual 2-step deck-select handshake into
- * ApiBattleStart, then real ApiSelect stepping until state.isFinish() --
- * see "Deck-select sequencing" and "ptcg_engine C++ surface to call
- * directly" in the skill.
- *
- * Two things are deliberately still stubbed, each named as its own later
- * phase in the skill, not oversights:
- *  - decide() steps don't interpret `action`'s content yet (the
- *    legal-vs-illegal / under-minCount-padding tiering is Phase 4). Step()
- *    self-drives with a uniformly random legal-sized, legal-index pick from
- *    the live engine state instead, using this env's own gen_ (Env<Spec>'s
- *    per-env RNG). That proves the real ApiSelect/IsDone sequencing end to
- *    end without depending on Phase 3's observation encoding to exist first
- *    (there'd otherwise be no way for an external caller to know what
- *    `options` even means well enough to choose from it).
- *  - the 6 obs tensors stay all-zero for every step, decide() included, and
- *    reward stays 0.0 always including the terminal step -- Phase 3 ports
- *    the real per-field encoder, Phase 4 adds the apiResult()-derived
- *    +1/-1/0 terminal reward rule.
- *
- * Deck-select *is* fully real already: the 60-slot action is read verbatim
- * as that seat's deck and handed to ApiBattleStart, since (per "Action
- * space" in the skill) that has no legal/illegal-vs-padding tiering to defer
- * -- legality there is just whatever ApiBattleStart itself enforces.
+ * Phases 2-4 (envpool-ptcg-integration skill) are all wired in:
+ *  - Phase 2: real Reset()/Step() flow -- 2-step deck-select handshake into
+ *    ApiBattleStart, deviceRand=false throughput fix, real ApiSelect
+ *    stepping, IsDone() via state.isFinish().
+ *  - Phase 2.5: forced-full-select and prize-select are auto-resolved
+ *    inside ResolveBypassedSelectsThenRespond()'s loop -- see "Trajectory &
+ *    prompt routing" -- so they never reach Python as their own decision
+ *    point, matching production main.py:agent()'s exact behavior.
+ *  - Phase 3: decide()-step observations are real encoder output
+ *    (ptcg_encode.h's EncodeObservation, a C++ port of encode.py), not
+ *    Zero()'d placeholders. Deck-select steps (and the terminal step -- see
+ *    WriteState) still Zero(), since there's no board/decision to encode.
+ *  - Phase 4: decide()'s `action` is genuinely interpreted now (illegal-vs-
+ *    under-minCount tiering, "Action space" in the skill) instead of Phase
+ *    2's self-driven random-legal-pick stand-in; deck-select's illegal-deck
+ *    case and decide()'s illegal-action case both apply the same instant-
+ *    loss-for-the-offender reward pattern board_games::IllegalRewards uses
+ *    (envpool/pgx/board_games.h), adapted to this env's single-reward-per-
+ *    step shape (see "Reward" in the skill) instead of that pattern's dual-
+ *    player broadcast, which doesn't fit here.
  */
 class PtcgEnv : public Env<PtcgEnvSpec> {
  protected:
@@ -169,7 +157,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     if (is_deck_select_) {
       StepDeckSelect(action);
     } else {
-      StepDecide();
+      StepDecide(action);
     }
   }
 
@@ -196,16 +184,19 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     std::copy(deck0_.begin(), deck0_.end(), cards.begin());
     std::copy(deck1_.begin(), deck1_.end(), cards.begin() + kActionSlots);
     StartData start = ApiBattleStart(cards.data());
-    // Phase 2's own test methodology always supplies two real legal decks
-    // (the skill's Phase 2 checklist "random valid deck" means the *caller*
-    // picks a deck that's valid, not that this env tolerates an invalid
-    // one) -- hitting this means a test bug, not a real scenario to handle
-    // gracefully yet. Phase 4 ("deck-legality check for deck-select")
-    // replaces this CHECK with the real illegal-action penalty, attributed
-    // via errorPlayer.
-    CHECK(start.battlePtr != nullptr)
-        << "ApiBattleStart rejected the Phase 2 test decks: errorPlayer="
-        << start.errorPlayer << " errorType=" << start.errorType;
+    if (start.battlePtr == nullptr) {
+      // Illegal deck -> instant loss for whichever seat ApiBattleStart
+      // named, mirroring board_games::IllegalRewards's pattern (see the
+      // class comment) -- "Action space" in the skill: "An invalid deck
+      // gets the illegal-action penalty, attributed via errorPlayer." Note
+      // errorPlayer isn't necessarily current_player_ (==1 here): a bad
+      // seat-0 deck submitted on the *previous* Step() call only surfaces
+      // once ApiBattleStart actually runs, on this one.
+      current_player_ = start.errorPlayer;
+      done_ = true;
+      WriteState(-1.0F);
+      return;
+    }
     battle_ = start.battlePtr;
     // Throughput fix -- see "Architecture at a glance" / "ptcg_engine C++
     // surface to call directly" in the skill. Must happen before any
@@ -216,40 +207,116 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     battle_->game.config.deviceRand = false;
 
     is_deck_select_ = false;
-    SyncFromEngine();
-    WriteState(0.0F);
+    ResolveBypassedSelectsThenRespond();
   }
 
-  void StepDecide() {
+  void StepDecide(const Action& action) {
     auto& state = battle_->state;
-    // state.selectMin <= state.selectMax <= state.options.size() is already
-    // guaranteed by the engine itself (State::step(), State.h) by the time
-    // ApiSelect/ApiBattleStart return -- no extra clamping needed here.
-    //
-    // Real interpretation of `action` (legal-vs-illegal, under-minCount
-    // padding) is Phase 4 -- see the class comment. This instead picks
-    // uniformly among legal-sized, legal-index choices using gen_
-    // (Env<Spec>'s own per-env RNG, seeded from config at construction --
-    // distinct from the engine's own battle_->game.rng, which Phase 2.5's
-    // prize-select bypass will use instead for production parity; no such
-    // parity concern applies to this Phase 2 stand-in).
-    std::uniform_int_distribution<int> count_dist(state.selectMin,
-                                                   state.selectMax);
-    int count = count_dist(gen_);
+    std::vector<int> chosen;
+    for (int i = 0; i < kActionSlots; ++i) {
+      int v = action["action"_][i];
+      if (v != -1) {
+        chosen.push_back(v);
+      }
+    }
+    if (static_cast<int>(chosen.size()) < state.selectMin) {
+      // Under minCount -> pad, don't penalize: production explicitly
+      // tolerates and pads short answers with random remaining valid
+      // indices ("Action space" in the skill, mirroring
+      // main.py:agent()'s own tolerant behavior). gen_ (Env<Spec>'s
+      // per-env RNG) is fine here -- unlike Phase 2.5's prize-select bypass,
+      // there's no production-RNG-parity concern: the policy already made
+      // its intentional picks, this only fills in blanks it declined to
+      // specify.
+      std::vector<int> remaining;
+      for (int i = 0; i < static_cast<int>(state.options.size()); ++i) {
+        if (std::find(chosen.begin(), chosen.end(), i) == chosen.end()) {
+          remaining.push_back(i);
+        }
+      }
+      std::shuffle(remaining.begin(), remaining.end(), gen_);
+      int need = state.selectMin - static_cast<int>(chosen.size());
+      for (int i = 0; i < need && i < static_cast<int>(remaining.size());
+           ++i) {
+        chosen.push_back(remaining[i]);
+      }
+    }
+
+    // Everything else -- out-of-range, exceeds maxCount, duplicate -- is
+    // left for the engine's own state.checkPlayerSelect() (State.h), run at
+    // the top of ApiSelect, rather than re-derived by hand here: reusing
+    // the authoritative check mirrors deck-select's "legality is whatever
+    // ApiBattleStart itself enforces" philosophy ("Action space" in the
+    // skill), and checkPlayerSelect()'s error codes are exactly the
+    // illegal-vs-not distinction that section describes.
+    int error =
+        ApiSelect(battle_, chosen.data(), static_cast<int>(chosen.size()));
+    if (error != 0) {
+      // Illegal action -> instant loss for the offender (state.selectPlayer,
+      // == current_player_, unambiguous here unlike deck-select's
+      // errorPlayer indirection). ApiSelect returns before calling
+      // data->next() on any error (Api.h), so battle_->state is completely
+      // unchanged -- no SyncFromEngine() call, and WriteState correctly
+      // Zero()s the obs rather than re-encoding a decision that never
+      // advanced.
+      done_ = true;
+      WriteState(-1.0F);
+      return;
+    }
+    ResolveBypassedSelectsThenRespond();
+  }
+
+  // Runs ApiSelect's own bypass loop forward through any forced-full-select/
+  // prize-select decision points (Phase 2.5, "Trajectory & prompt routing"),
+  // then computes the terminal-only reward ("Reward" in the skill) and
+  // writes the response. Shared by both StepDeckSelect's post-ApiBattleStart
+  // path and StepDecide's post-ApiSelect path -- deliberately, since a
+  // just-started battle's first decision point could in principle itself be
+  // bypassed (astronomically unlikely, but free to handle correctly by
+  // reusing this rather than special-casing it away).
+  void ResolveBypassedSelectsThenRespond() {
+    while (!battle_->state.isFinish() && IsBypassedSelect(battle_->state)) {
+      std::vector<int> bypass = ComputeBypassSelection();
+      int error = ApiSelect(battle_, bypass.data(),
+                            static_cast<int>(bypass.size()));
+      CHECK_EQ(error, 0)
+          << "bypass-computed selection was rejected by ApiSelect -- bug in "
+             "the Phase 2.5 bypass logic, not a real scenario";
+    }
+    float reward = 0.0F;
+    if (battle_->state.isFinish()) {
+      // "Reward" in the skill: state.apiResult() (-1/0/1/2), not a raw
+      // GameResult cast. For *that step's player* (state.selectPlayer):
+      // +1.0 if apiResult()==selectPlayer, -1.0 if it's the other player's
+      // index, 0.0 on draw.
+      int result = battle_->state.apiResult();
+      int actor = battle_->state.selectPlayer;
+      if (result != 2) {
+        reward = (result == actor) ? 1.0F : -1.0F;
+      }
+    }
+    SyncFromEngine();
+    WriteState(reward);
+  }
+
+  std::vector<int> ComputeBypassSelection() {
+    auto& state = battle_->state;
+    if (IsForcedFullSelect(state)) {
+      std::vector<int> all(state.options.size());
+      std::iota(all.begin(), all.end(), 0);
+      return all;
+    }
+    // Prize-select: uniform random sample of maxCount indices, using the
+    // battle's own per-instance RNG (battle_->game.rng) rather than gen_
+    // (Env<Spec>'s per-env RNG) -- "Trajectory & prompt routing" in the
+    // skill: this needs to be consistent with the rest of *that battle's*
+    // randomness for production parity, unlike StepDecide's under-minCount
+    // padding above, which has no such parity concern.
     std::vector<int> indices(state.options.size());
     std::iota(indices.begin(), indices.end(), 0);
-    std::shuffle(indices.begin(), indices.end(), gen_);
-    indices.resize(count);
-
-    int error = ApiSelect(battle_, indices.data(),
-                           static_cast<int>(indices.size()));
-    CHECK_EQ(error, 0)
-        << "legal-but-dumb pick rejected by ApiSelect -- bug in the Phase 2 "
-           "stand-in's selectMin/selectMax/options.size() bookkeeping, not "
-           "a real scenario";
-
-    SyncFromEngine();
-    WriteState(0.0F);
+    std::shuffle(indices.begin(), indices.end(), battle_->game.rng);
+    indices.resize(state.selectMax);
+    return indices;
   }
 
   void SyncFromEngine() {
@@ -260,22 +327,37 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
 
   void WriteState(float reward) {
     auto state = Allocate();
-    // Both deck-select and (still-stubbed) decide steps leave these 6
-    // tensors at all-zeros through Phase 2 -- Phase 3 is what starts writing
-    // real per-field encoder output for decide() steps. NOT a free
-    // Allocate() default either way: StateBuffer's backing arrays are a
+    // Not a free Allocate() default -- StateBuffer's backing arrays are a
     // ring buffer allocated once per AsyncEnvPool and zero-initialized only
-    // at that one construction -- Allocate() hands back a *reused* slice on
-    // every later call, still holding whatever a previous env/step wrote
-    // there. Explicit Zero() is required on every write that doesn't fill a
-    // field itself, or an observation can leak a stale, possibly-hidden
-    // previous game's encoded board.
+    // at that one construction; every later Allocate() call hands back a
+    // *reused* slice, still holding whatever a previous env/step wrote
+    // there. Explicit Zero() is required unconditionally here, even though
+    // EncodeObservation below overwrites most of it in the common case --
+    // it never writes 100% of every tensor (pokemons rows with no Pokemon
+    // there, options rows past the real option count, ...), and skipping
+    // Zero() would leak whatever a prior ring-buffer occupant last wrote
+    // into exactly those gaps.
     state["obs:cards"_].Zero();
     state["obs:pokemons"_].Zero();
     state["obs:player_state"_].Zero();
     state["obs:state"_].Zero();
     state["obs:select"_].Zero();
     state["obs:options"_].Zero();
+    if (!is_deck_select_ && !done_) {
+      // Real encoder output only for a genuine, non-terminal, non-bypassed
+      // decide() step -- exactly encode_observation()'s own documented
+      // precondition. Deck-select steps have no board to encode; the
+      // terminal step is intentionally left Zero()'d too (production never
+      // calls encode_observation() in an already-finished game either, so
+      // there's no ground truth to match, and state.selectType may already
+      // be cleared by then -- see ptcg_encode.h's EncodeObservation doc
+      // comment).
+      const auto& deck = current_player_ == 0 ? deck0_ : deck1_;
+      EncodeObservation(battle_->state, deck, state["obs:cards"_],
+                        state["obs:pokemons"_], state["obs:player_state"_],
+                        state["obs:state"_], state["obs:select"_],
+                        state["obs:options"_]);
+    }
     state["info:current_player"_] = current_player_;
     state["info:is_deck_select"_] = is_deck_select_;
     state["reward"_] = reward;

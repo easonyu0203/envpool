@@ -32,6 +32,22 @@ void ExpectAllZero(const Array& arr) {
   }
 }
 
+// Phase 3: a real decide() step's obs should never be all-zero -- `cards`
+// alone is enough to tell, since both seats' own 60 rows always carry real,
+// non-sentinel card ids (see ptcg_encode.h's WriteCards). Not a full
+// correctness check (that's ptcg_encode_test.cc's job) -- just a smoke
+// signal that the encoder actually ran instead of silently falling through
+// to the Zero()'d default.
+void ExpectNotAllZero(const Array& arr) {
+  const auto* data = reinterpret_cast<const int*>(arr.Data());
+  for (std::size_t i = 0; i < arr.size; ++i) {
+    if (data[i] != 0) {
+      return;
+    }
+  }
+  FAIL() << "expected at least one non-zero cell";
+}
+
 // Same real, deck-legal 60-card list as ptcg_smoke_test.cc and
 // research/envpool_smoke/concurrency_smoke.cpp, copied from
 // submissions/sample_submission/deck.csv. Both seats use it.
@@ -52,17 +68,24 @@ struct EnvTrack {
 
 }  // namespace
 
-// Phase 2 test (envpool-ptcg-integration skill): drives real
+// Phases 2-4 test (envpool-ptcg-integration skill): drives real
 // ApiBattleStart/ApiSelect calls, not Phase 1's fake fixed-length episode.
 // Real games are nondeterministic in length and first-player assignment (see
 // "Resets are nondeterministic" in the skill -- ApiBattleStart has no seed
 // parameter), so unlike Phase 1's exact-sequence table, this asserts
 // structural invariants across full real episodes: deck-select is always
 // exactly the first 2 steps of an episode with current_player 0 then 1;
-// decide() steps keep current_player in {0,1}; obs tensors are all-zero and
-// reward is 0.0 on every step (Phase 3/4 change that); every env eventually
-// reaches done. Same "diff structurally, not bit-exact" adjustment Phase 0
-// already made for the same underlying reason.
+// decide() steps keep current_player in {0,1}; obs tensors are all-zero on
+// deck-select/terminal steps and non-trivial (real encoder output, Phase 3)
+// on decide() steps; reward is 0.0 except on the step done becomes true,
+// where it's the real apiResult()-derived terminal reward (Phase 4) --
+// every action sent here is always legal (a real deck, or a -1-filled
+// dummy that Phase 4's under-minCount padding turns into a legal pick), so
+// this test's games always end via genuine win/loss/draw, never the
+// illegal-action penalty path (see ptcg_envpool_illegal_test.cc for that);
+// every env eventually reaches done. Same "diff structurally, not
+// bit-exact" adjustment Phase 0 already made for the same underlying
+// reason.
 //
 // num_envs == batch_size == 3 (sync mode): real games run dozens+ of
 // decide() calls each, which alone cycles every StateBuffer ring-buffer slot
@@ -98,18 +121,28 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       int env_id = static_cast<int>(state["info:env_id"_][i]);
       EnvTrack& t = track[env_id];
 
-      ExpectAllZero(state["obs:cards"_][i]);
-      ExpectAllZero(state["obs:pokemons"_][i]);
-      ExpectAllZero(state["obs:player_state"_][i]);
-      ExpectAllZero(state["obs:state"_][i]);
-      ExpectAllZero(state["obs:select"_][i]);
-      ExpectAllZero(state["obs:options"_][i]);
-      EXPECT_FLOAT_EQ(static_cast<float>(state["reward"_][i]), 0.0F);
-
       bool is_deck_select =
           static_cast<bool>(state["info:is_deck_select"_][i]);
       int current_player = static_cast<int>(state["info:current_player"_][i]);
       bool done = static_cast<bool>(state["done"_][i]);
+      float reward = static_cast<float>(state["reward"_][i]);
+
+      if (is_deck_select || done) {
+        ExpectAllZero(state["obs:cards"_][i]);
+        ExpectAllZero(state["obs:pokemons"_][i]);
+        ExpectAllZero(state["obs:player_state"_][i]);
+        ExpectAllZero(state["obs:state"_][i]);
+        ExpectAllZero(state["obs:select"_][i]);
+        ExpectAllZero(state["obs:options"_][i]);
+      } else {
+        ExpectNotAllZero(state["obs:cards"_][i]);
+      }
+      if (done) {
+        EXPECT_TRUE(reward == 1.0F || reward == 0.0F || reward == -1.0F)
+            << "env_id=" << env_id << " reward=" << reward;
+      } else {
+        EXPECT_FLOAT_EQ(reward, 0.0F) << "env_id=" << env_id;
+      }
 
       EXPECT_EQ(is_deck_select, t.episode_step < 2)
           << "env_id=" << env_id << " episode_step=" << t.episode_step;

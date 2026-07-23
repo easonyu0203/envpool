@@ -23,7 +23,7 @@
 # training-only, never-published project has no reason to build.
 load("@pybind11_bazel//:build_defs.bzl", "pybind_extension")
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("//envpool:requirements.bzl", "requirement")
 
 py_library(
@@ -43,9 +43,14 @@ py_library(
 
 cc_library(
     name = "ptcg_envpool_h",
-    hdrs = ["ptcg_envpool.h"],
+    hdrs = [
+        "ptcg_encode.h",  # Phase 3: encode.py port
+        "ptcg_envpool.h",
+        "ptcg_schema.h",  # Phase 3: schema.py port, shared by the above two
+    ],
     copts = ["-std=c++20"],
     deps = [
+        "//envpool/core:array",
         "//envpool/core:async_envpool",
         "//envpool/core:env",
         "//envpool/core:logging",
@@ -57,6 +62,61 @@ cc_test(
     name = "ptcg_envpool_test",
     size = "small",
     srcs = ["ptcg_envpool_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [
+        ":ptcg_envpool_h",
+        "//envpool/core:logging",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ptcg_encode_test",
+    size = "small",
+    srcs = ["ptcg_encode_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [
+        ":ptcg_envpool_h",
+        "//envpool/core:logging",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ptcg_envpool_illegal_test",
+    size = "small",
+    srcs = ["ptcg_envpool_illegal_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [
+        ":ptcg_envpool_h",
+        "//envpool/core:logging",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# Phase 5 (envpool-ptcg-integration skill): fixtures generated once by
+# tests/encoding/generate_ptcg_encode_fixtures.py in the main repo (not part
+# of this build) and checked in -- see ptcg_cross_validation_test.cc.
+cc_test(
+    name = "ptcg_cross_validation_test",
+    size = "small",
+    srcs = ["ptcg_cross_validation_test.cc"],
+    copts = ["-std=c++20"],
+    data = ["testdata/cross_validation_fixtures.txt"],
+    deps = [
+        ":ptcg_envpool_h",
+        "//envpool/core:logging",
+        "@bazel_tools//tools/cpp/runfiles",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# Phase 6 (envpool-ptcg-integration skill): AGENTS.md's "deterministic test"
+# tier.
+cc_test(
+    name = "ptcg_deterministic_test",
+    size = "small",
+    srcs = ["ptcg_deterministic_test.cc"],
     copts = ["-std=c++20"],
     deps = [
         ":ptcg_envpool_h",
@@ -78,6 +138,22 @@ py_test(
         "//envpool/python:api",
         requirement("numpy"),
         requirement("absl-py"),
+    ],
+)
+
+# Phase 7 (envpool-ptcg-integration skill): run via
+# `bazel run //envpool/ptcg:bench_envpool -- --out /abs/path ...` -- a bare
+# `python`/`uv run` invocation can't resolve envpool.ptcg's compiled
+# extension correctly (see "Build path" in the skill).
+py_binary(
+    name = "bench_envpool",
+    srcs = ["bench_envpool.py"],
+    imports = ["../.."],
+    deps = [
+        ":ptcg",
+        ":ptcg_registration",
+        "//envpool:registration",
+        requirement("numpy"),
     ],
 )
 

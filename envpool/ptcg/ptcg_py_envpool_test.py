@@ -11,11 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit test for the Phase 2 ptcg envpool (real ptcg_engine calls).
+"""Unit test for the Phases 2-4 ptcg envpool (real ptcg_engine calls, the
+C++-ported observation encoder, and full action-space validation/reward).
 
-See the envpool-ptcg-integration skill's "Phased implementation checklist" --
-Phase 2's bar is the real Reset()/Step() flow: 2-step deck-select handshake
-into ApiBattleStart, then real ApiSelect stepping until state.isFinish().
+See the envpool-ptcg-integration skill's "Phased implementation checklist":
+Phase 2's real Reset()/Step() flow (2-step deck-select handshake into
+ApiBattleStart, real ApiSelect stepping until state.isFinish()); Phase 2.5's
+forced-full-select/prize-select auto-resolution, invisible from here except
+that it means every observation Python actually sees is a genuine decision;
+Phase 3's real per-field encoder output on decide() steps (ptcg_encode.h,
+tested for structural self-consistency in ptcg_encode_test.cc -- this file
+doesn't re-derive that, just checks the obs stops being all-zero); Phase 4's
+real action-space validation (illegal-vs-under-minCount for decide(),
+deck-legality for deck-select) and the resulting terminal reward.
+
 Real games are nondeterministic in length and first-player assignment (no
 seed parameter on ApiBattleStart -- see "Resets are nondeterministic" in the
 skill), so unlike Phase 1's fixed 6-step fake episode, these tests assert
@@ -87,6 +96,26 @@ class PtcgEnvPoolTest(absltest.TestCase):
             sorted(_PtcgEnvSpec._config_keys), sorted(ref_config_keys)
         )
 
+    def test_registry_coverage(self) -> None:
+        # Phase 6 (envpool-ptcg-integration skill): AGENTS.md's "Registry
+        # Coverage" test tier -- "Ptcg-v0" is registered (through our own
+        # scoped envpool.ptcg.registration import at module level above,
+        # not envpool/entry.py's aggregate -- see "Build path" in the
+        # skill) with the right spec/dm/gymnasium classes. No aliases:
+        # this family has exactly one task id, nothing to enumerate beyond
+        # it (unlike an upstream-backed family with many scenario IDs).
+        from envpool.registration import registry
+
+        self.assertIn("Ptcg-v0", registry.list_all_envs())
+        import_path, spec_cls, _kwargs = registry.specs["Ptcg-v0"]
+        self.assertEqual(import_path, "envpool.ptcg")
+        self.assertEqual(spec_cls, "PtcgEnvSpec")
+        envpool_entry = registry.envpools["Ptcg-v0"]
+        self.assertEqual(envpool_entry["dm"], ("envpool.ptcg", "PtcgDMEnvPool"))
+        self.assertEqual(
+            envpool_entry["gymnasium"], ("envpool.ptcg", "PtcgGymnasiumEnvPool")
+        )
+
     def test_spec(self) -> None:
         conf = _default_conf()
         env_spec = _PtcgEnvSpec(tuple(conf.values()))
@@ -99,10 +128,10 @@ class PtcgEnvPoolTest(absltest.TestCase):
         # ArraySpec tuples are (shape, dtype-bounds...); index 1 is shape,
         # matching dummy_py_envpool_test.py's state_spec[...][1] usage.
         self.assertEqual(tuple(state_spec["obs:cards"][1]), (120, 5))
-        self.assertEqual(tuple(state_spec["obs:pokemons"][1]), (18, 15))
+        self.assertEqual(tuple(state_spec["obs:pokemons"][1]), (18, 18))
         self.assertEqual(tuple(state_spec["obs:player_state"][1]), (2, 9))
         self.assertEqual(tuple(state_spec["obs:state"][1]), (8,))
-        self.assertEqual(tuple(state_spec["obs:select"][1]), (16,))
+        self.assertEqual(tuple(state_spec["obs:select"][1]), (18,))
         self.assertEqual(tuple(state_spec["obs:options"][1]), (63, 19))
         self.assertEqual(tuple(state_spec["info:current_player"][1]), ())
         self.assertEqual(tuple(state_spec["info:is_deck_select"][1]), ())
@@ -117,13 +146,23 @@ class PtcgEnvPoolTest(absltest.TestCase):
         # version of this test: the 6 obs tensors are zero only because
         # PtcgEnv calls Array::Zero() on every write, not because Allocate()
         # zero-inits on every call (see WriteState's comment in
-        # ptcg_envpool.h).
+        # ptcg_envpool.h). Since Phase 3, that's only true for deck-select
+        # and terminal steps -- a real decide() step's obs is real encoder
+        # output instead (checked for structural self-consistency in
+        # ptcg_encode_test.cc, not re-derived here).
         #
         # Also exercises AsyncEnvPool's auto-reset: Send()-ing any action
         # for an env_id that just reported done triggers Reset() instead of
         # Step() (async_envpool.h:127) -- this loop keeps driving every env,
         # including ones that already finished once, until the slowest one
         # finishes its first episode too.
+        #
+        # Every action sent here is always legal (a real deck, or a
+        # -1-filled dummy that Phase 4's under-minCount padding turns into a
+        # legal pick), so these games always end via genuine win/loss/draw,
+        # never the illegal-action penalty path -- see
+        # test_illegal_deck_penalizes_offending_seat /
+        # test_illegal_decide_action_penalizes_actor below for that.
         num_envs = 3
         conf = _default_conf(
             num_envs=num_envs, batch_size=num_envs, num_threads=1
@@ -135,7 +174,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         def recv_dict() -> dict:
             return dict(zip(state_keys, env._recv(), strict=False))
 
-        def assert_zero_obs(state: dict) -> None:
+        def assert_zero_obs(state: dict, slot: int) -> None:
             for key in (
                 "obs:cards",
                 "obs:pokemons",
@@ -145,8 +184,15 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 "obs:options",
             ):
                 np.testing.assert_array_equal(
-                    state[key], np.zeros_like(state[key])
+                    state[key][slot], np.zeros_like(state[key][slot])
                 )
+
+        def assert_not_all_zero_cards(state: dict, slot: int) -> None:
+            # `cards` alone is enough to tell the encoder ran: both seats'
+            # own 60 rows always carry real, non-sentinel card ids (see
+            # ptcg_encode.h's WriteCards) -- a smoke signal, not the full
+            # correctness check (that's ptcg_encode_test.cc's job).
+            self.assertTrue(bool(np.any(state["obs:cards"][slot] != 0)))
 
         track = [
             {
@@ -158,10 +204,6 @@ class PtcgEnvPoolTest(absltest.TestCase):
         ]
 
         def process(state: dict) -> None:
-            assert_zero_obs(state)
-            np.testing.assert_array_equal(
-                state["reward"], np.zeros(num_envs, dtype=np.float32)
-            )
             env_ids = state["info:env_id"]
             for slot in range(num_envs):
                 env_id = int(env_ids[slot])
@@ -169,6 +211,16 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 is_deck_select = bool(state["info:is_deck_select"][slot])
                 current_player = int(state["info:current_player"][slot])
                 done = bool(state["done"][slot])
+                reward = float(state["reward"][slot])
+
+                if is_deck_select or done:
+                    assert_zero_obs(state, slot)
+                else:
+                    assert_not_all_zero_cards(state, slot)
+                if done:
+                    self.assertIn(reward, (1.0, 0.0, -1.0), f"env_id={env_id}")
+                else:
+                    self.assertEqual(reward, 0.0, f"env_id={env_id}")
 
                 self.assertEqual(
                     is_deck_select,
@@ -239,10 +291,10 @@ class PtcgEnvPoolTest(absltest.TestCase):
         env = make("Ptcg-v0", env_type="gymnasium", num_envs=num_envs)
         obs, info = env.reset()
         self.assertEqual(obs["cards"].shape, (num_envs, 120, 5))
-        self.assertEqual(obs["pokemons"].shape, (num_envs, 18, 15))
+        self.assertEqual(obs["pokemons"].shape, (num_envs, 18, 18))
         self.assertEqual(obs["player_state"].shape, (num_envs, 2, 9))
         self.assertEqual(obs["state"].shape, (num_envs, 8))
-        self.assertEqual(obs["select"].shape, (num_envs, 16))
+        self.assertEqual(obs["select"].shape, (num_envs, 18))
         self.assertEqual(obs["options"].shape, (num_envs, 63, 19))
         np.testing.assert_array_equal(
             info["is_deck_select"], np.ones(num_envs, dtype=bool)
@@ -265,10 +317,15 @@ class PtcgEnvPoolTest(absltest.TestCase):
             info["current_player"], np.ones(num_envs, dtype=np.int32)
         )
 
-        obs, _reward, terminated, _truncated, info = env.step(deck_action)
+        obs, reward, terminated, _truncated, info = env.step(deck_action)
         np.testing.assert_array_equal(
             info["is_deck_select"], np.zeros(num_envs, dtype=bool)
         )
+        # Phase 3: a real decide() step's obs is real encoder output, not
+        # all-zero (see ptcg_encode_test.cc for the actual correctness
+        # check). Phase 4: reward is 0.0 on every non-terminal step.
+        self.assertTrue(bool(np.any(obs["cards"] != 0)))
+        np.testing.assert_array_equal(reward, np.zeros(num_envs, dtype=np.float32))
 
         round_count = 0
         while not terminated.any():
@@ -278,12 +335,125 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 "no env reached done within the safety bound",
             )
             round_count += 1
-            obs, _reward, terminated, _truncated, info = env.step(
+            obs, reward, terminated, _truncated, info = env.step(
                 dummy_action
             )
             self.assertEqual(obs["cards"].shape, (num_envs, 120, 5))
+            for slot in range(num_envs):
+                if terminated[slot]:
+                    self.assertIn(float(reward[slot]), (1.0, 0.0, -1.0))
+                else:
+                    self.assertEqual(float(reward[slot]), 0.0)
 
         self.assertTrue(terminated.any())
+
+    def test_illegal_deck_penalizes_offending_seat(self) -> None:
+        # Phase 4 test, mirroring ptcg_envpool_illegal_test.cc's C++ version
+        # of the same scenario -- see that file's top comment for why
+        # single-env/single-scenario tests are the right shape here (the
+        # happy-path test above never exercises this path, since every
+        # action it sends is legal by construction).
+        conf = _default_conf(num_envs=1, batch_size=1, num_threads=1)
+        env_spec = _PtcgEnvSpec(tuple(conf.values()))
+        env = _PtcgEnvPool(env_spec)
+        state_keys = env._state_keys
+
+        def recv_dict() -> dict:
+            return dict(zip(state_keys, env._recv(), strict=False))
+
+        def send(slots) -> dict:
+            env._send((
+                np.array([0], dtype=np.int32),
+                np.array([0], dtype=np.int32),
+                np.array([slots], dtype=np.int32),
+            ))
+            return recv_dict()
+
+        env._reset(np.array([0], dtype=np.int32))
+        state = recv_dict()
+        self.assertTrue(bool(state["info:is_deck_select"][0]))
+        self.assertEqual(int(state["info:current_player"][0]), 0)
+
+        state = send(_DECK)  # seat 0's real, legal deck
+        self.assertTrue(bool(state["info:is_deck_select"][0]))
+        self.assertEqual(int(state["info:current_player"][0]), 1)
+
+        # Seat 1's deck: an id that doesn't exist in CardTable at all --
+        # ApiBattleStart's very first per-card check (Api.h: `if
+        # (!CardTable.contains(id)) return {nullptr, i, 1}`), deliberately
+        # illegal, no dependency on any specific card's type/count rules.
+        state = send([999999] * _ACTION_SLOTS)
+
+        self.assertTrue(bool(state["done"][0]))
+        self.assertEqual(float(state["reward"][0]), -1.0)
+        self.assertEqual(
+            int(state["info:current_player"][0]), 1,
+            "errorPlayer should name seat 1: both decks are only validated "
+            "once ApiBattleStart actually runs, which happens on seat 1's "
+            "Step()",
+        )
+        for key in (
+            "obs:cards", "obs:pokemons", "obs:player_state",
+            "obs:state", "obs:select", "obs:options",
+        ):
+            np.testing.assert_array_equal(
+                state[key][0], np.zeros_like(state[key][0])
+            )
+
+    def test_illegal_decide_action_penalizes_actor(self) -> None:
+        # Phase 4 test, mirroring ptcg_envpool_illegal_test.cc's C++ version.
+        conf = _default_conf(num_envs=1, batch_size=1, num_threads=1)
+        env_spec = _PtcgEnvSpec(tuple(conf.values()))
+        env = _PtcgEnvPool(env_spec)
+        state_keys = env._state_keys
+
+        def recv_dict() -> dict:
+            return dict(zip(state_keys, env._recv(), strict=False))
+
+        def send(slots) -> dict:
+            env._send((
+                np.array([0], dtype=np.int32),
+                np.array([0], dtype=np.int32),
+                np.array([slots], dtype=np.int32),
+            ))
+            return recv_dict()
+
+        env._reset(np.array([0], dtype=np.int32))
+        recv_dict()  # Reset()'s own response -- must be drained before the
+                     # send()/recv() pairs below, or every round after it
+                     # reads one round stale (see the identical gotcha this
+                     # hit in ptcg_envpool_illegal_test.cc).
+
+        send(_DECK)              # seat 0's deck
+        state = send(_DECK)      # seat 1's deck -> ApiBattleStart
+        # Phase 2.5's bypass loop guarantees whatever's pending now is a
+        # genuine, non-bypassed decision -- safe to answer illegally on
+        # purpose.
+        self.assertFalse(bool(state["info:is_deck_select"][0]))
+        actor_before = int(state["info:current_player"][0])
+
+        bad_action = [-1] * _ACTION_SLOTS
+        # Safely within ActionSpec's declared bound ({-1, N_CARD_IDS-1}) but
+        # essentially certain to exceed the real options count for any
+        # early-game decision -- an out-of-range pick, per "Action space" in
+        # the skill.
+        bad_action[0] = 500
+        state = send(bad_action)
+
+        self.assertTrue(bool(state["done"][0]))
+        self.assertEqual(float(state["reward"][0]), -1.0)
+        self.assertEqual(
+            int(state["info:current_player"][0]), actor_before,
+            "no SyncFromEngine happens on the illegal path -- "
+            "current_player_ stays exactly what it was announced as",
+        )
+        for key in (
+            "obs:cards", "obs:pokemons", "obs:player_state",
+            "obs:state", "obs:select", "obs:options",
+        ):
+            np.testing.assert_array_equal(
+                state[key][0], np.zeros_like(state[key][0])
+            )
 
 
 if __name__ == "__main__":
