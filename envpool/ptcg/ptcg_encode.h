@@ -348,10 +348,15 @@ class ObservationEncoder {
       resolving_counter++;
       room--;
     };
-    maybe_register_fallback(state_.contextCard);
+    // Order matters: mine_room/opp_room are shared mutable state across both
+    // calls, so which of the two (if both are simultaneously unregistered
+    // and room is scarce) gets the RESOLVING row vs the PRIZE_DECK fallback
+    // pointer depends on call order. Must match encode.py's `for c in
+    // (select.effect, select.contextCard)` (effect first) exactly.
     if (state_.onEffect()) {
       maybe_register_fallback(state_.getEffectCard().card);
     }
+    maybe_register_fallback(state_.contextCard);
 
     // mine_hidden_ids = +(Counter(my_deck) - Counter(mine_revealed_ids)) --
     // mine_revealed_ids_ already includes any RESOLVING rows registered just
