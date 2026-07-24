@@ -32,10 +32,26 @@ shape research/env_speed/bench.py's baseline uses (uniformly random among
 valid options), so the two numbers are a fair throughput comparison even
 though neither is a trained policy.
 
-Usage (num_envs defaults to a sweep from 1 to os.cpu_count()):
+--batch-size controls async overlap: batch_size == num_envs (the default,
+one entry per --num-envs value) is fully synchronous -- every round waits
+for all num_envs results before sending the next batch. batch_size <
+num_envs runs AsyncEnvPool's actual async mode via async_reset()+recv()/
+send(): each recv() returns whichever `batch_size` envs finished first,
+so a slow env (e.g. one mid-reset, paying the one-time per-episode
+ApiBattleStart shuffle cost -- see the envpool-ptcg-integration skill)
+doesn't stall the ones that are ready. --batch-size accepts either one
+value (broadcast to every --num-envs entry, for sweeping the num_envs:
+batch_size ratio at a fixed batch_size) or a comma list the same length
+as --num-envs (per-entry override).
+
+Usage (num_envs defaults to a sweep from 1 to os.cpu_count(), batch_size
+defaults to sync i.e. batch_size == num_envs):
     bazel run //envpool/ptcg:bench_envpool -- \\
         --out /abs/path/to/research/env_speed/results_envpool_TIMESTAMP.json
     bazel run //envpool/ptcg:bench_envpool -- --num-envs 1,2,4,8 --duration-sec 5
+    # async ratio sweep at a fixed batch_size == num_threads == 8:
+    bazel run //envpool/ptcg:bench_envpool -- \\
+        --num-envs 8,10,12,16,24,32 --batch-size 8 --num-threads 8
 """
 
 import argparse
@@ -89,29 +105,36 @@ def _cpu_model() -> str | None:
     return platform.processor() or None
 
 
-def _gymnasium_stepper(num_envs: int, num_threads: int):
-    """The normal, documented path: make() + the Gymnasium wrapper."""
+def _gymnasium_stepper(num_envs: int, batch_size: int, num_threads: int):
+    """The normal, documented path: make() + the Gymnasium wrapper's async
+    send/recv API (async_reset() once, then recv()/send() in a loop). This
+    is envpool's actual async mechanism -- each recv() drains exactly
+    `batch_size` env results, whichever finish first, and send() re-arms
+    only those env_ids -- and it subsumes the synchronous case for free:
+    when batch_size == num_envs, the first recv() drains the whole round
+    just like env.step() would, so callers don't need a separate sync path.
+    """
     env = make(
-        "Ptcg-v0", env_type="gymnasium", num_envs=num_envs, batch_size=num_envs,
+        "Ptcg-v0", env_type="gymnasium", num_envs=num_envs, batch_size=batch_size,
         num_threads=num_threads,
     )
-    dummy_action = np.full((num_envs, _ACTION_SLOTS), -1, dtype=np.int32)
-    deck_action = np.tile(_DECK, (num_envs, 1)).astype(np.int32)
+    dummy_action = np.full((batch_size, _ACTION_SLOTS), -1, dtype=np.int32)
+    deck_action = np.tile(_DECK, (batch_size, 1)).astype(np.int32)
 
-    _obs, info = env.reset()
-    is_deck_select = info["is_deck_select"]
+    env.async_reset()
 
     def step_once() -> int:
-        nonlocal is_deck_select
-        action = np.where(is_deck_select[:, None], deck_action, dummy_action)
-        _obs, _reward, terminated, _truncated, info = env.step(action)
+        _obs, _reward, terminated, _truncated, info = env.recv()
+        env_id = info["env_id"]
         is_deck_select = info["is_deck_select"]
+        action = np.where(is_deck_select[:, None], deck_action, dummy_action)
+        env.send(action, env_id)
         return int(terminated.sum())
 
     return step_once
 
 
-def _raw_api_stepper(num_envs: int, num_threads: int):
+def _raw_api_stepper(num_envs: int, batch_size: int, num_threads: int):
     """Diagnostic path: raw `_PtcgEnvPool`/`_send`/`_recv`, bypassing both
     make()'s config-kwargs layer and the Gymnasium wrapper's obs/info dict
     reshaping -- same raw pattern ptcg_py_envpool_test.py's
@@ -120,7 +143,15 @@ def _raw_api_stepper(num_envs: int, num_threads: int):
     envpool-ptcg-integration skill's "Cross-validation"/Part-1 discussion in
     research/env_speed/README.md) is the wrapper layers specifically, versus
     AsyncEnvPool's own queue/pybind cost underneath both paths.
+
+    Sync-only (batch_size must equal num_envs): this path's env_id handling
+    always sends/expects the full arange(num_envs) every round, unlike
+    _gymnasium_stepper's async recv()-driven env_id. Not worth generalizing
+    -- it exists to isolate wrapper overhead, not to run the async sweep.
     """
+    if batch_size != num_envs:
+        raise ValueError("--raw-api only supports batch_size == num_envs (sync)")
+
     from envpool.ptcg.ptcg_envpool import _PtcgEnvPool, _PtcgEnvSpec
 
     conf = dict(
@@ -154,9 +185,12 @@ def _raw_api_stepper(num_envs: int, num_threads: int):
 
 
 def run_one_config(
-    num_envs: int, num_threads: int, duration_sec: float, warmup_sec: float, raw_api: bool
+    num_envs: int, batch_size: int, num_threads: int, duration_sec: float, warmup_sec: float,
+    raw_api: bool
 ) -> dict:
-    step_once = (_raw_api_stepper if raw_api else _gymnasium_stepper)(num_envs, num_threads)
+    step_once = (_raw_api_stepper if raw_api else _gymnasium_stepper)(
+        num_envs, batch_size, num_threads
+    )
 
     t_end = time.perf_counter() + warmup_sec
     while time.perf_counter() < t_end:
@@ -170,10 +204,14 @@ def run_one_config(
         completed_games += step_once()
         rounds += 1
     wall_s = time.perf_counter() - t_start
-    total_decisions = rounds * num_envs
+    # Each round's step_once() advances exactly one recv()-sized batch of
+    # envs (== batch_size, whether or not that equals num_envs -- see
+    # _gymnasium_stepper), not the full num_envs.
+    total_decisions = rounds * batch_size
 
     return {
         "num_envs": num_envs,
+        "batch_size": batch_size,
         "num_threads": num_threads,
         "raw_api": raw_api,
         "rounds": rounds,
@@ -190,6 +228,12 @@ def main() -> None:
     parser.add_argument(
         "--num-envs", default=None,
         help="comma-separated num_envs values to sweep (default: 1,2,4,...,os.cpu_count())",
+    )
+    parser.add_argument(
+        "--batch-size", default=None,
+        help="batch_size per config: one value (broadcast to every --num-envs entry, for an "
+        "async num_envs:batch_size ratio sweep) or a comma list the same length as --num-envs "
+        "(per-entry override). Default: batch_size == num_envs for every entry (fully sync).",
     )
     parser.add_argument("--num-threads", type=int, default=0, help="0 = envpool auto (min(batch, cpu_count))")
     parser.add_argument("--duration-sec", type=float, default=10.0, help="timed duration per config")
@@ -212,6 +256,20 @@ def main() -> None:
             n *= 2
         num_envs_list.append(cpu_count)
 
+    if args.batch_size is None:
+        batch_size_list = list(num_envs_list)
+    else:
+        raw = [int(x) for x in args.batch_size.split(",")]
+        batch_size_list = raw if len(raw) > 1 else raw * len(num_envs_list)
+        if len(batch_size_list) != len(num_envs_list):
+            raise SystemExit(
+                f"--batch-size has {len(batch_size_list)} values, expected 1 or "
+                f"{len(num_envs_list)} (matching --num-envs)"
+            )
+    for ne, bs in zip(num_envs_list, batch_size_list, strict=True):
+        if bs > ne:
+            raise SystemExit(f"batch_size ({bs}) must be <= num_envs ({ne})")
+
     meta = {
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "git_commit": _git_commit(),
@@ -226,14 +284,19 @@ def main() -> None:
     }
 
     runs = []
-    for num_envs in num_envs_list:
-        print(f"running num_envs={num_envs} num_threads={args.num_threads} raw_api={args.raw_api} ...", file=sys.stderr)
+    for num_envs, batch_size in zip(num_envs_list, batch_size_list, strict=True):
+        print(
+            f"running num_envs={num_envs} batch_size={batch_size} "
+            f"num_threads={args.num_threads} raw_api={args.raw_api} ...",
+            file=sys.stderr,
+        )
         result = run_one_config(
-            num_envs, args.num_threads, args.duration_sec, args.warmup_sec, args.raw_api
+            num_envs, batch_size, args.num_threads, args.duration_sec, args.warmup_sec,
+            args.raw_api
         )
         runs.append(result)
         print(
-            f"  num_envs={num_envs}: games/sec={result['games_per_sec']:.2f} "
+            f"  num_envs={num_envs} batch_size={batch_size}: games/sec={result['games_per_sec']:.2f} "
             f"decisions/sec={result['decisions_per_sec']:.1f} "
             f"completed_games={result['completed_games']}",
             file=sys.stderr,
@@ -241,7 +304,7 @@ def main() -> None:
 
     baseline = runs[0]["games_per_sec"] if runs else 1.0
     for r in runs:
-        r["scaling_vs_num_envs_1"] = r["games_per_sec"] / baseline if baseline > 0 else None
+        r["scaling_vs_first_run"] = r["games_per_sec"] / baseline if baseline > 0 else None
 
     out = {"meta": meta, "runs": runs}
 
