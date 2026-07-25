@@ -5,6 +5,20 @@ common --enable_platform_specific_config
 
 build --incompatible_strict_action_env
 build --incompatible_default_to_explicit_init_py
+
+# --- pokemon-ai project addition (not upstream sail-sg/envpool) ---
+# workspace1.bzl's python_register_multi_toolchains() default_version is
+# "3.12", but this repo's actual runtime target (pyproject.toml/.python-version,
+# matching the confirmed Kaggle match-time interpreter -- see
+# kaggle-submission-mechanics skill) is 3.11.13. A compiled extension's ABI is
+# tied to its minor Python version, so a bare `bazel build` here silently
+# produces a ptcg_envpool.so that `ImportError`s ("Python version mismatch")
+# the moment the repo's own .venv (3.11) tries to load it -- pin the default
+# here rather than relying on every future `bazel build`/`test` invocation to
+# remember `--@rules_python//python/config_settings:python_version=3.11`.
+build --@rules_python//python/config_settings:python_version=3.11
+# --- end pokemon-ai project addition ---
+
 build:debug --cxxopt=-DENVPOOL_TEST --compilation_mode=dbg -s
 build:test --cxxopt=-DENVPOOL_TEST --copt=-g0 --copt=-O3 --copt=-DNDEBUG
 build:release --copt=-g0 --copt=-O3 --copt=-DNDEBUG
