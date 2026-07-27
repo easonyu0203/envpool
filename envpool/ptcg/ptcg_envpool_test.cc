@@ -126,6 +126,7 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       int current_player = static_cast<int>(state["info:current_player"_][i]);
       bool done = static_cast<bool>(state["done"_][i]);
       float reward = static_cast<float>(state["reward"_][i]);
+      int finish_reason = static_cast<int>(state["info:finish_reason"_][i]);
 
       if (is_deck_select || done) {
         ExpectAllZero(state["obs:cards"_][i]);
@@ -140,8 +141,18 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       if (done) {
         EXPECT_TRUE(reward == 1.0F || reward == 0.0F || reward == -1.0F)
             << "env_id=" << env_id << " reward=" << reward;
+        // Every game in this test ends via a real engine win/loss/draw,
+        // never the illegal-action penalty path (see the doc comment
+        // above) -- so finish_reason should always be a genuine non-None
+        // FinishReason (State.h: Prize0=1, Deck0=2, NoActivePokemon=3,
+        // Effect=4, Other=9), never left at its 0 default.
+        EXPECT_TRUE(finish_reason == 1 || finish_reason == 2 ||
+                    finish_reason == 3 || finish_reason == 4 ||
+                    finish_reason == 9)
+            << "env_id=" << env_id << " finish_reason=" << finish_reason;
       } else {
         EXPECT_FLOAT_EQ(reward, 0.0F) << "env_id=" << env_id;
+        EXPECT_EQ(finish_reason, 0) << "env_id=" << env_id;
       }
 
       EXPECT_EQ(is_deck_select, t.episode_step < 2)

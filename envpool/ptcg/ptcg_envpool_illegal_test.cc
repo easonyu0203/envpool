@@ -101,6 +101,8 @@ TEST(PtcgEnvPoolIllegalTest, IllegalDeckPenalizesOffendingSeat) {
       << "errorPlayer should name seat 1: both decks are only validated "
          "once ApiBattleStart actually runs, which happens on seat 1's "
          "Step() (see StepDeckSelect's comment on this)";
+  EXPECT_EQ(static_cast<int>(state["info:finish_reason"_][0]), 0)
+      << "an illegal deck never reaches the engine's own finishCheck()";
   ExpectAllZero(state["obs:cards"_][0]);
   ExpectAllZero(state["obs:pokemons"_][0]);
   ExpectAllZero(state["obs:player_state"_][0]);
@@ -147,6 +149,9 @@ TEST(PtcgEnvPoolIllegalTest, IllegalDecideActionPenalizesActor) {
       << "no SyncFromEngine happens on the illegal path -- ApiSelect "
          "returns before calling data->next() on any error (Api.h), so "
          "current_player_ stays exactly what it was announced as";
+  EXPECT_EQ(static_cast<int>(state["info:finish_reason"_][0]), 0)
+      << "ApiSelect returned before advancing state, so the engine's own "
+         "finishCheck() never ran on this action";
   ExpectAllZero(state["obs:cards"_][0]);
   ExpectAllZero(state["obs:pokemons"_][0]);
   ExpectAllZero(state["obs:player_state"_][0]);

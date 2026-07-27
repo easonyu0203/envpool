@@ -49,7 +49,14 @@ class PtcgEnvFns {
         // Routing metadata, not part of the 6 encoded tensors above -- see
         // "Observation space" in the envpool-ptcg-integration skill.
         "info:current_player"_.Bind(Spec<int>({}, {0, 1})),
-        "info:is_deck_select"_.Bind(Spec<bool>({})));
+        "info:is_deck_select"_.Bind(Spec<bool>({})),
+        // Raw State.h FinishReason cast to int: None=0, Prize0=1, Deck0=2,
+        // NoActivePokemon=3, Effect=4, Other=9. Only meaningful on a row
+        // where `terminated` came from the engine's own state.isFinish()
+        // (see ResolveBypassedSelectsThenRespond) -- stays 0 on every other
+        // row, including the envpool-side illegal-action instant-loss
+        // terminations, which never run the engine's real finishCheck().
+        "info:finish_reason"_.Bind(Spec<int>({}, {0, 9})));
   }
 
   template <typename Config>
@@ -109,6 +116,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   bool done_{true};
   bool is_deck_select_{true};
   int current_player_{0};
+  int finish_reason_{0};
   ApiData* battle_{nullptr};
   std::array<int, kActionSlots> deck0_{};
   std::array<int, kActionSlots> deck1_{};
@@ -150,6 +158,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     done_ = false;
     is_deck_select_ = true;
     current_player_ = 0;
+    finish_reason_ = 0;
     WriteState(0.0F);
   }
 
@@ -176,6 +185,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
 
     if (current_player_ == 0) {
       current_player_ = 1;
+      finish_reason_ = 0;
       WriteState(0.0F);
       return;
     }
@@ -194,6 +204,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
       // once ApiBattleStart actually runs, on this one.
       current_player_ = start.errorPlayer;
       done_ = true;
+      finish_reason_ = 0;
       WriteState(-1.0F);
       return;
     }
@@ -260,6 +271,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
       // Zero()s the obs rather than re-encoding a decision that never
       // advanced.
       done_ = true;
+      finish_reason_ = 0;
       WriteState(-1.0F);
       return;
     }
@@ -294,6 +306,12 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
       if (result != 2) {
         reward = (result == actor) ? 1.0F : -1.0F;
       }
+      // Real engine-side finish -- state.finishCheck() has already run
+      // (called internally by ApiSelect/data->next()) and set finishReason,
+      // so this is the one place a non-zero value is ever recorded.
+      finish_reason_ = static_cast<int>(battle_->state.finishReason);
+    } else {
+      finish_reason_ = 0;
     }
     SyncFromEngine();
     WriteState(reward);
@@ -360,6 +378,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     }
     state["info:current_player"_] = current_player_;
     state["info:is_deck_select"_] = is_deck_select_;
+    state["info:finish_reason"_] = finish_reason_;
     state["reward"_] = reward;
   }
 };

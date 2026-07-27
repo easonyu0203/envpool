@@ -135,6 +135,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         self.assertEqual(tuple(state_spec["obs:options"][1]), (63, 19))
         self.assertEqual(tuple(state_spec["info:current_player"][1]), ())
         self.assertEqual(tuple(state_spec["info:is_deck_select"][1]), ())
+        self.assertEqual(tuple(state_spec["info:finish_reason"][1]), ())
         self.assertEqual(
             tuple(action_spec["action"][1]), (_ACTION_SLOTS,)
         )
@@ -212,6 +213,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 current_player = int(state["info:current_player"][slot])
                 done = bool(state["done"][slot])
                 reward = float(state["reward"][slot])
+                finish_reason = int(state["info:finish_reason"][slot])
 
                 if is_deck_select or done:
                     assert_zero_obs(state, slot)
@@ -219,8 +221,18 @@ class PtcgEnvPoolTest(absltest.TestCase):
                     assert_not_all_zero_cards(state, slot)
                 if done:
                     self.assertIn(reward, (1.0, 0.0, -1.0), f"env_id={env_id}")
+                    # Every game in this test ends via a real engine
+                    # win/loss/draw, never the illegal-action penalty path
+                    # (see this test's docstring) -- so finish_reason should
+                    # always be a genuine non-None FinishReason (State.h:
+                    # Prize0=1, Deck0=2, NoActivePokemon=3, Effect=4,
+                    # Other=9), never left at its 0 default.
+                    self.assertIn(
+                        finish_reason, (1, 2, 3, 4, 9), f"env_id={env_id}"
+                    )
                 else:
                     self.assertEqual(reward, 0.0, f"env_id={env_id}")
+                    self.assertEqual(finish_reason, 0, f"env_id={env_id}")
 
                 self.assertEqual(
                     is_deck_select,
@@ -342,8 +354,10 @@ class PtcgEnvPoolTest(absltest.TestCase):
             for slot in range(num_envs):
                 if terminated[slot]:
                     self.assertIn(float(reward[slot]), (1.0, 0.0, -1.0))
+                    self.assertIn(int(info["finish_reason"][slot]), (1, 2, 3, 4, 9))
                 else:
                     self.assertEqual(float(reward[slot]), 0.0)
+                    self.assertEqual(int(info["finish_reason"][slot]), 0)
 
         self.assertTrue(terminated.any())
 
@@ -391,6 +405,10 @@ class PtcgEnvPoolTest(absltest.TestCase):
             "errorPlayer should name seat 1: both decks are only validated "
             "once ApiBattleStart actually runs, which happens on seat 1's "
             "Step()",
+        )
+        self.assertEqual(
+            int(state["info:finish_reason"][0]), 0,
+            "an illegal deck never reaches the engine's own finishCheck()",
         )
         for key in (
             "obs:cards", "obs:pokemons", "obs:player_state",
@@ -446,6 +464,11 @@ class PtcgEnvPoolTest(absltest.TestCase):
             int(state["info:current_player"][0]), actor_before,
             "no SyncFromEngine happens on the illegal path -- "
             "current_player_ stays exactly what it was announced as",
+        )
+        self.assertEqual(
+            int(state["info:finish_reason"][0]), 0,
+            "ApiSelect returned before advancing state, so the engine's "
+            "own finishCheck() never ran on this action",
         )
         for key in (
             "obs:cards", "obs:pokemons", "obs:player_state",
