@@ -67,6 +67,7 @@ constexpr int kPokemonPos = 2;
 
 namespace options_col {
 constexpr int kIsValid = 0;
+constexpr int kType = 1;
 constexpr int kCardValid = 10;
 constexpr int kCardIsMe = 11;
 constexpr int kCardPokemonPos = 12;
@@ -76,9 +77,12 @@ constexpr int kCardId = 15;
 constexpr int kPokemonValid = 16;
 constexpr int kPokemonIsMe = 17;
 constexpr int kPokemonPos = 18;
+constexpr int kAlreadySelected = 19;
 }  // namespace options_col
 
 namespace select_col {
+constexpr int kMinCount = 2;
+constexpr int kMaxCount = 3;
 constexpr int kContextCardValid = 6;
 constexpr int kContextCardIsMe = 7;
 constexpr int kContextCardPokemonPos = 8;
@@ -95,6 +99,45 @@ constexpr int kEffectCardId = 17;
 
 int Cell(const TArray<int>& arr, int row, int col) { return arr[row][col]; }
 int Cell1D(const TArray<int>& arr, int col) { return arr[col]; }
+
+// Copies an obs:options view into stable storage -- the Array it wraps is a
+// slice of AsyncEnvPool's ring buffer, liable to be overwritten by the time
+// the next round's Send() is built (see ptcg_envpool.h's WriteState comment
+// on why an unconditional Zero() is needed at all), so it can't be read
+// lazily from the original TArray across a Send()/Recv() boundary.
+std::vector<int> CopyOptions(const TArray<int>& options) {
+  std::vector<int> out(ptcg::kOptionRows * ptcg::kOptionsCols);
+  for (int row = 0; row < ptcg::kOptionRows; ++row) {
+    for (int col = 0; col < ptcg::kOptionsCols; ++col) {
+      out[row * ptcg::kOptionsCols + col] = Cell(options, row, col);
+    }
+  }
+  return out;
+}
+
+// Picks the first legal (is_valid && !already_selected) row -- real options
+// sort before ptcg::kStopSlot, so this greedily keeps picking real options
+// up to selectMax before ever reaching STOP. is_valid alone isn't enough: a
+// real row stays is_valid=1 forever once picked (structural, unaffected by
+// already_selected), so without the already_selected check this would pick
+// the same already-chosen row again on a decision's second+ sub-pick, which
+// LegalActions() correctly rejects as illegal. Every genuine decide()-step
+// observation is guaranteed to offer at least one real legal row (Python
+// only ever sees >=2-way decisions -- see ptcg_envpool.h's
+// AutoResolveForcedSubPicksThenRespond -- and STOP alone can never account
+// for more than one of those two-plus legal slots), so this always finds
+// a real pick, never STOP, keeping every game's action sequence trivially
+// legal by construction.
+int PickLegalAction(const std::vector<int>& options_flat) {
+  for (int row = 0; row < ptcg::kOptionRows; ++row) {
+    if (options_flat[row * ptcg::kOptionsCols + options_col::kIsValid] == 1 &&
+        options_flat[row * ptcg::kOptionsCols + options_col::kAlreadySelected] == 0) {
+      return row;
+    }
+  }
+  ADD_FAILURE() << "no legal action found in observed options -- envpool invariant violated";
+  return ptcg::kStopSlot;
+}
 
 // Mirrors tests/support/invariants.py's _find_card_row/_check_pointer.
 bool FindCardRow(const TArray<int>& cards, int is_me, int pokemon_pos, int area,
@@ -181,6 +224,31 @@ void CheckStructuralInvariants(const PtcgState& state, int slot) {
     }
   }
 
+  // STOP row (ptcg::kStopSlot, one past the real rows checked above): its
+  // is_valid directly encodes whether stopping is currently legal
+  // (picks-so-far, read off the real rows' already_selected column, vs
+  // select.min_count) -- no separate padding-zero expectation the way real
+  // rows past n_valid_opts have, since this row is always meaningfully
+  // populated on a genuine decide()-step observation.
+  int n_already_selected = 0;
+  for (int row = 0; row < n_valid_opts; ++row) {
+    n_already_selected += Cell(options, row, options_col::kAlreadySelected);
+  }
+  bool expected_can_stop = n_already_selected >= Cell1D(select, select_col::kMinCount);
+  EXPECT_EQ(Cell(options, ptcg::kStopSlot, options_col::kIsValid), expected_can_stop ? 1 : 0)
+      << "n_already_selected=" << n_already_selected
+      << " min_count=" << Cell1D(select, select_col::kMinCount);
+  EXPECT_EQ(Cell(options, ptcg::kStopSlot, options_col::kType), ptcg::kStopOptionType);
+  EXPECT_EQ(Cell(options, ptcg::kStopSlot, options_col::kAlreadySelected), 0)
+      << "STOP row must never itself be already_selected";
+  for (int col = 0; col < ptcg::kOptionsCols; ++col) {
+    if (col == options_col::kIsValid || col == options_col::kType) {
+      continue;
+    }
+    EXPECT_EQ(Cell(options, ptcg::kStopSlot, col), 0)
+        << "STOP row has non-zero data outside is_valid/type at col=" << col;
+  }
+
   for (int row = 0; row < n_valid_opts; ++row) {
     CheckCardPointer(cards, "options.card", Cell(options, row, options_col::kCardValid),
                      Cell(options, row, options_col::kCardIsMe),
@@ -234,6 +302,7 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
     bool done = false;
     bool completed_once = false;
     int checked_decide_steps = 0;
+    std::vector<int> last_options;  // valid only when !is_deck_select && !done
   };
   std::vector<EnvTrack> track(num_envs);
 
@@ -247,6 +316,7 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
       if (!is_deck_select && !done) {
         CheckStructuralInvariants(state, i);
         t.checked_decide_steps++;
+        t.last_options = CopyOptions(TArray<int>(state["obs:options"_][i]));
       }
       t.is_deck_select = is_deck_select;
       t.done = done;
@@ -276,7 +346,14 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
       action["players.env_id"_][i] = i;
       EnvTrack& t = track[i];
       bool send_real_deck = !t.done && t.is_deck_select;
-      for (int j = 0; j < ptcg::kActionSlots; ++j) {
+      int first_slot = -1;
+      if (send_real_deck) {
+        first_slot = kDeck[0];
+      } else if (!t.done) {
+        first_slot = PickLegalAction(t.last_options);
+      }
+      action["action"_][i][0] = first_slot;
+      for (int j = 1; j < ptcg::kActionSlots; ++j) {
         action["action"_][i][j] = send_real_deck ? kDeck[j] : -1;
       }
     }

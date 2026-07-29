@@ -58,11 +58,24 @@ cc_library(
     ],
 )
 
+# linkopts: absl's log-internal message formatting needs dladdr() (glibc's
+# <dlfcn.h>) -- see the matching comment on ptcg_cross_validation_test/
+# ptcg_deterministic_test below and the pybind_extension target's own
+# (pre-existing) "-ldl", the same fix. Observed flaky without it: whether a
+# given cc_test happens to link clean depends on unrelated build-graph link
+# order pulling libdl in for free or not, not on anything specific to that
+# target's own source.
+_DL_LINKOPTS = select({
+    "//:windows": [],
+    "//conditions:default": ["-ldl"],
+})
+
 cc_test(
     name = "ptcg_envpool_test",
     size = "small",
     srcs = ["ptcg_envpool_test.cc"],
     copts = ["-std=c++20"],
+    linkopts = _DL_LINKOPTS,
     deps = [
         ":ptcg_envpool_h",
         "//envpool/core:logging",
@@ -75,6 +88,7 @@ cc_test(
     size = "small",
     srcs = ["ptcg_encode_test.cc"],
     copts = ["-std=c++20"],
+    linkopts = _DL_LINKOPTS,
     deps = [
         ":ptcg_envpool_h",
         "//envpool/core:logging",
@@ -87,6 +101,7 @@ cc_test(
     size = "small",
     srcs = ["ptcg_envpool_illegal_test.cc"],
     copts = ["-std=c++20"],
+    linkopts = _DL_LINKOPTS,
     deps = [
         ":ptcg_envpool_h",
         "//envpool/core:logging",
@@ -103,6 +118,7 @@ cc_test(
     srcs = ["ptcg_cross_validation_test.cc"],
     copts = ["-std=c++20"],
     data = ["testdata/cross_validation_fixtures.txt"],
+    linkopts = _DL_LINKOPTS,
     deps = [
         ":ptcg_envpool_h",
         "//envpool/core:logging",
@@ -118,6 +134,7 @@ cc_test(
     size = "small",
     srcs = ["ptcg_deterministic_test.cc"],
     copts = ["-std=c++20"],
+    linkopts = _DL_LINKOPTS,
     deps = [
         ":ptcg_envpool_h",
         "//envpool/core:logging",

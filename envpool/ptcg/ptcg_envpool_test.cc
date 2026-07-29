@@ -64,7 +64,49 @@ struct EnvTrack {
   bool done = false;
   int episode_step = 0;  // resets to 0 whenever a fresh episode begins
   bool completed_once = false;
+  std::vector<int> last_options;  // valid only when !is_deck_select && !done
 };
+
+// Copies an obs:options view into stable storage -- the Array it wraps is a
+// slice of AsyncEnvPool's ring buffer, liable to be overwritten by the time
+// the next round's Send() is built.
+std::vector<int> CopyOptions(const TArray<int>& options) {
+  std::vector<int> out(ptcg::kOptionRows * ptcg::kOptionsCols);
+  for (int row = 0; row < ptcg::kOptionRows; ++row) {
+    for (int col = 0; col < ptcg::kOptionsCols; ++col) {
+      out[row * ptcg::kOptionsCols + col] = options[row][col];
+    }
+  }
+  return out;
+}
+
+// Picks the first legal (is_valid && !already_selected) row -- real options
+// sort before ptcg::kStopSlot, so this greedily keeps picking real options
+// up to selectMax before ever reaching STOP. is_valid alone isn't enough: a
+// real row stays is_valid=1 forever once picked (structural, unaffected by
+// already_selected -- see schema.py's OPTIONS_COLUMNS comment), so without
+// the already_selected check this would pick the same already-chosen row
+// again on a decision's second+ sub-pick, which LegalActions() correctly
+// rejects as illegal. Every genuine decide()-step observation is guaranteed
+// to offer at least one real legal row (Python only ever sees >=2-way
+// decisions -- see ptcg_envpool.h's AutoResolveForcedSubPicksThenRespond --
+// and STOP alone can never account for more than one of those two-plus
+// legal slots), so this always finds a real pick, never STOP, keeping every
+// game's action sequence trivially legal by construction -- exactly the
+// same role the old -1-filled dummy action played back when under-minCount
+// padding made any action legal.
+int PickLegalAction(const std::vector<int>& options_flat) {
+  constexpr int kIsValidCol = 0;          // OPTIONS_COLUMNS[0], see schema.py
+  constexpr int kAlreadySelectedCol = 19;  // OPTIONS_COLUMNS[-1]
+  for (int row = 0; row < ptcg::kOptionRows; ++row) {
+    if (options_flat[row * ptcg::kOptionsCols + kIsValidCol] == 1 &&
+        options_flat[row * ptcg::kOptionsCols + kAlreadySelectedCol] == 0) {
+      return row;
+    }
+  }
+  ADD_FAILURE() << "no legal action found in observed options -- envpool invariant violated";
+  return ptcg::kStopSlot;
+}
 
 }  // namespace
 
@@ -79,13 +121,13 @@ struct EnvTrack {
 // deck-select/terminal steps and non-trivial (real encoder output, Phase 3)
 // on decide() steps; reward is 0.0 except on the step done becomes true,
 // where it's the real apiResult()-derived terminal reward (Phase 4) --
-// every action sent here is always legal (a real deck, or a -1-filled
-// dummy that Phase 4's under-minCount padding turns into a legal pick), so
-// this test's games always end via genuine win/loss/draw, never the
-// illegal-action penalty path (see ptcg_envpool_illegal_test.cc for that);
-// every env eventually reaches done. Same "diff structurally, not
-// bit-exact" adjustment Phase 0 already made for the same underlying
-// reason.
+// every action sent here is always legal (a real deck, or a real option
+// row read off the just-observed obs:options and picked by
+// PickLegalAction(), see its comment), so this test's games always end via
+// genuine win/loss/draw, never the illegal-action penalty path (see
+// ptcg_envpool_illegal_test.cc for that); every env eventually reaches
+// done. Same "diff structurally, not bit-exact" adjustment Phase 0 already
+// made for the same underlying reason.
 //
 // num_envs == batch_size == 3 (sync mode): real games run dozens+ of
 // decide() calls each, which alone cycles every StateBuffer ring-buffer slot
@@ -137,6 +179,7 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
         ExpectAllZero(state["obs:options"_][i]);
       } else {
         ExpectNotAllZero(state["obs:cards"_][i]);
+        t.last_options = CopyOptions(TArray<int>(state["obs:options"_][i]));
       }
       if (done) {
         EXPECT_TRUE(reward == 1.0F || reward == 0.0F || reward == -1.0F)
@@ -201,7 +244,14 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       // for that slot this round, it starts a fresh episode's deck-select
       // regardless of what's sent.
       bool send_real_deck = !t.done && t.is_deck_select;
-      for (int j = 0; j < ptcg::kActionSlots; ++j) {
+      int first_slot = -1;
+      if (send_real_deck) {
+        first_slot = kDeck[0];
+      } else if (!t.done) {
+        first_slot = PickLegalAction(t.last_options);
+      }
+      action["action"_][i][0] = first_slot;
+      for (int j = 1; j < ptcg::kActionSlots; ++j) {
         action["action"_][i][j] = send_real_deck ? kDeck[j] : -1;
       }
       if (t.done) {

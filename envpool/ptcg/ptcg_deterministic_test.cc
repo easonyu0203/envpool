@@ -67,11 +67,15 @@ struct Encoded {
   Array player_state{Spec<int>({ptcg::kPlayerStateRows, ptcg::kPlayerStateCols})};
   Array state{Spec<int>({ptcg::kStateCols})};
   Array select{Spec<int>({ptcg::kSelectCols})};
-  Array options{Spec<int>({ptcg::kMaxOptions, ptcg::kOptionsCols})};
+  Array options{Spec<int>({ptcg::kOptionRows, ptcg::kOptionsCols})};
 
+  // Deliberately always the very start of a decision (already_selected
+  // empty) -- this test is about raw engine/encoder determinism given
+  // identical inputs, not about exercising PtcgEnv's own per-index
+  // accumulation (that's ptcg_envpool_test.cc's job).
   static Encoded From(const State& state, const std::array<int, ptcg::kActionSlots>& deck) {
     Encoded e;
-    ptcg::EncodeObservation(state, deck, e.cards, e.pokemons, e.player_state,
+    ptcg::EncodeObservation(state, deck, {}, e.cards, e.pokemons, e.player_state,
                             e.state, e.select, e.options);
     return e;
   }

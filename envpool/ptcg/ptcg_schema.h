@@ -47,12 +47,28 @@ constexpr int kStateCols = 8;
 // says `len(SELECT_COLUMNS) == 18` (6 scalar fields + two 6-field card
 // pointers -- see ptcg_encode.h's WriteSelect).
 constexpr int kSelectCols = 18;
-constexpr int kOptionsCols = 19;
+// 19 real-option fields (schema.py's OPTIONS_COLUMNS through pokemon_pos)
+// + 1 already_selected column (schema.py's N_OPTION_SLOTS/STOP_SLOT design
+// -- see the comment there for why an "already picked this decision" flag
+// and an engine-appended STOP row exist at all).
+constexpr int kOptionsCols = 20;
+// The options tensor's row index dedicated to the engine-appended STOP
+// pseudo-option (schema.py's STOP_SLOT), and the tensor's total row count
+// (schema.py's N_OPTION_SLOTS): kMaxOptions real rows + 1 STOP row, always
+// present on a genuine decide()-step observation.
+constexpr int kStopSlot = kMaxOptions;
+constexpr int kOptionRows = kMaxOptions + 1;
+// The STOP row's "type" column value -- one past every real
+// SelectOptionType (ApiType.h: Number=0 .. SpecialCondition=16, 17 values),
+// so it can never collide with a genuine option. Mirrors encode.py's
+// STOP_OPTION_TYPE = len(OptionType); no shared codegen, so this is a
+// literal, cross-checked against ApiType.h's SelectOptionType by hand.
+constexpr int kStopOptionType = 17;
 
 // Deck-select and decide() share one action shape (see "Action space" in the
 // envpool-ptcg-integration skill): 60 slots, all real values (card ids) for
-// deck-select, up to maxCount real option-row indices + -1 padding for
-// decide().
+// deck-select; decide() only ever reads slot 0 -- one option-row index
+// (0..kMaxOptions-1) or kStopSlot for STOP -- the rest are ignored padding.
 constexpr int kActionSlots = 60;
 
 }  // namespace ptcg

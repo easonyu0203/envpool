@@ -39,12 +39,18 @@ using bazel::tools::cpp::runfiles::Runfiles;
 // matching EncodedObservation were captured from the *same* instant of one
 // real ctypes-driven game, per "The mechanism matters" in the skill: driving
 // two independently-seeded games and diffing decision-by-decision would
-// desync silently the moment either side's RNG-call order diverges.
+// desync silently the moment either side's RNG-call order diverges. Each
+// case also carries an `already_selected` set (empty for most cases, a
+// random non-empty subset for maxCount>1 decisions) exercising the
+// options.already_selected column and the engine-appended STOP row
+// (schema.py's STOP_SLOT) under a genuine mid-multi-pick state, not just a
+// decision's first call.
 namespace {
 
 struct FixtureCase {
   std::string base64;
   std::array<int, ptcg::kActionSlots> my_deck{};
+  std::vector<int> already_selected;  // indices into select.option, see generate_ptcg_encode_fixtures.py
   std::vector<int> cards, pokemons, player_state, state, select, options;
 };
 
@@ -68,6 +74,10 @@ std::vector<FixtureCase> LoadFixtures(const std::string& path) {
     for (int& v : c.my_deck) {
       ifs >> v;
     }
+    int k = 0;
+    ifs >> k;
+    c.already_selected.resize(k);
+    ReadInts(ifs, &c.already_selected);
     c.cards.resize(ptcg::kMaxCards * ptcg::kCardsCols);
     ReadInts(ifs, &c.cards);
     c.pokemons.resize(ptcg::kMaxPokemon * ptcg::kPokemonsCols);
@@ -78,7 +88,7 @@ std::vector<FixtureCase> LoadFixtures(const std::string& path) {
     ReadInts(ifs, &c.state);
     c.select.resize(ptcg::kSelectCols);
     ReadInts(ifs, &c.select);
-    c.options.resize(ptcg::kMaxOptions * ptcg::kOptionsCols);
+    c.options.resize(ptcg::kOptionRows * ptcg::kOptionsCols);
     ReadInts(ifs, &c.options);
   }
   if (ifs.fail() && !ifs.eof()) {
@@ -136,14 +146,14 @@ TEST(PtcgCrossValidationTest, BitExactAgainstPythonEncoder) {
         Spec<int>({ptcg::kPlayerStateRows, ptcg::kPlayerStateCols}));
     Array state_arr(Spec<int>({ptcg::kStateCols}));
     Array select_arr(Spec<int>({ptcg::kSelectCols}));
-    Array options_arr(Spec<int>({ptcg::kMaxOptions, ptcg::kOptionsCols}));
+    Array options_arr(Spec<int>({ptcg::kOptionRows, ptcg::kOptionsCols}));
     // No explicit Zero() needed here, unlike ptcg_envpool.h's WriteState --
     // this is Array's *owning* constructor (a fresh std::vector<char>(size),
     // which value-inits to zero), not Allocate()'s reused ring-buffer slice.
 
-    ptcg::EncodeObservation(data->state, c.my_deck, cards_arr, pokemons_arr,
-                            player_state_arr, state_arr, select_arr,
-                            options_arr);
+    ptcg::EncodeObservation(data->state, c.my_deck, c.already_selected,
+                            cards_arr, pokemons_arr, player_state_arr,
+                            state_arr, select_arr, options_arr);
 
     ExpectFlatEqual(cards_arr, c.cards, "cards", i);
     ExpectFlatEqual(pokemons_arr, c.pokemons, "pokemons", i);

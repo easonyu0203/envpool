@@ -64,6 +64,33 @@ _DECK = [
 ]
 
 
+_OPT_IS_VALID_COL = 0  # OPTIONS_COLUMNS[0], see schema.py
+_OPT_ALREADY_SELECTED_COL = 19  # OPTIONS_COLUMNS[-1], see schema.py
+
+
+def _pick_legal_action(options_row: np.ndarray) -> int:
+    """options_row: (64, 20) -- one env's raw obs:options. Picks the first
+    legal (is_valid && !already_selected) row; real options sort before the
+    STOP row (index 63), so this greedily keeps picking real options up to
+    selectMax before ever reaching STOP. is_valid alone isn't enough: a real
+    row stays is_valid=1 forever once picked (structural, unaffected by
+    already_selected -- see schema.py's OPTIONS_COLUMNS comment), so without
+    the already_selected check this would pick the same already-chosen row
+    again on a decision's second+ sub-pick, which the env's LegalActions()
+    correctly rejects as illegal. Every genuine decide()-step observation is
+    guaranteed to offer at least one real legal row (Python only ever sees
+    >=2-way decisions -- see ptcg_envpool.h's
+    AutoResolveForcedSubPicksThenRespond -- and STOP alone can never
+    account for more than one of those two-plus legal slots), so this
+    always finds a real pick, never STOP, keeping every game's action
+    sequence trivially legal by construction."""
+    legal = np.flatnonzero(
+        (options_row[:, _OPT_IS_VALID_COL] == 1) & (options_row[:, _OPT_ALREADY_SELECTED_COL] == 0)
+    )
+    assert legal.size > 0, "no legal action found -- envpool invariant violated"
+    return int(legal[0])
+
+
 def _default_conf(**overrides: object) -> dict:
     conf = dict(
         zip(
@@ -132,7 +159,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         self.assertEqual(tuple(state_spec["obs:player_state"][1]), (2, 9))
         self.assertEqual(tuple(state_spec["obs:state"][1]), (8,))
         self.assertEqual(tuple(state_spec["obs:select"][1]), (18,))
-        self.assertEqual(tuple(state_spec["obs:options"][1]), (63, 19))
+        self.assertEqual(tuple(state_spec["obs:options"][1]), (64, 20))
         self.assertEqual(tuple(state_spec["info:current_player"][1]), ())
         self.assertEqual(tuple(state_spec["info:is_deck_select"][1]), ())
         self.assertEqual(tuple(state_spec["info:finish_reason"][1]), ())
@@ -158,11 +185,11 @@ class PtcgEnvPoolTest(absltest.TestCase):
         # including ones that already finished once, until the slowest one
         # finishes its first episode too.
         #
-        # Every action sent here is always legal (a real deck, or a
-        # -1-filled dummy that Phase 4's under-minCount padding turns into a
-        # legal pick), so these games always end via genuine win/loss/draw,
-        # never the illegal-action penalty path -- see
-        # test_illegal_deck_penalizes_offending_seat /
+        # Every action sent here is always legal (a real deck, or a real
+        # option row read off the just-observed obs:options and picked by
+        # _pick_legal_action(), see its docstring), so these games always
+        # end via genuine win/loss/draw, never the illegal-action penalty
+        # path -- see test_illegal_deck_penalizes_offending_seat /
         # test_illegal_decide_action_penalizes_actor below for that.
         num_envs = 3
         conf = _default_conf(
@@ -201,6 +228,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 "done": False,
                 "episode_step": 0,
                 "completed_once": False,
+                "last_options": None,
             } for _ in range(num_envs)
         ]
 
@@ -219,6 +247,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
                     assert_zero_obs(state, slot)
                 else:
                     assert_not_all_zero_cards(state, slot)
+                    t["last_options"] = np.array(state["obs:options"][slot])
                 if done:
                     self.assertIn(reward, (1.0, 0.0, -1.0), f"env_id={env_id}")
                     # Every game in this test ends via a real engine
@@ -272,6 +301,8 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 # above.
                 if not t["done"] and t["is_deck_select"]:
                     action[env_id] = _DECK
+                elif not t["done"]:
+                    action[env_id, 0] = _pick_legal_action(t["last_options"])
                 if t["done"]:
                     t["episode_step"] = 0  # about to start a fresh episode
 
@@ -307,7 +338,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         self.assertEqual(obs["player_state"].shape, (num_envs, 2, 9))
         self.assertEqual(obs["state"].shape, (num_envs, 8))
         self.assertEqual(obs["select"].shape, (num_envs, 18))
-        self.assertEqual(obs["options"].shape, (num_envs, 63, 19))
+        self.assertEqual(obs["options"].shape, (num_envs, 64, 20))
         np.testing.assert_array_equal(
             info["is_deck_select"], np.ones(num_envs, dtype=bool)
         )
@@ -316,7 +347,18 @@ class PtcgEnvPoolTest(absltest.TestCase):
         )
 
         deck_action = np.tile(_DECK, (num_envs, 1)).astype(np.int32)
-        dummy_action = np.full((num_envs, _ACTION_SLOTS), -1, dtype=np.int32)
+
+        def legal_action(obs: dict) -> np.ndarray:
+            # -1-filled "dummy" actions are no longer universally legal
+            # (Phase 4's under-minCount padding, which used to tolerate
+            # that, is gone -- see ptcg_envpool.h's LegalActions()): every
+            # decide()-step action must be a real pick or STOP now, so pick
+            # one off the just-observed obs["options"] via
+            # _pick_legal_action() instead.
+            action = np.full((num_envs, _ACTION_SLOTS), -1, dtype=np.int32)
+            for slot in range(num_envs):
+                action[slot, 0] = _pick_legal_action(obs["options"][slot])
+            return action
 
         # Both envs started together via the same reset() call and
         # deck-select is always exactly 2 real steps, so both are guaranteed
@@ -348,7 +390,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
             )
             round_count += 1
             obs, reward, terminated, _truncated, info = env.step(
-                dummy_action
+                legal_action(obs)
             )
             self.assertEqual(obs["cards"].shape, (num_envs, 120, 5))
             for slot in range(num_envs):

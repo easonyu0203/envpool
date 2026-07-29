@@ -45,7 +45,7 @@ class PtcgEnvFns {
             Spec<int>({kPlayerStateRows, kPlayerStateCols})),
         "obs:state"_.Bind(Spec<int>({kStateCols})),
         "obs:select"_.Bind(Spec<int>({kSelectCols})),
-        "obs:options"_.Bind(Spec<int>({kMaxOptions, kOptionsCols})),
+        "obs:options"_.Bind(Spec<int>({kOptionRows, kOptionsCols})),
         // Routing metadata, not part of the 6 encoded tensors above -- see
         // "Observation space" in the envpool-ptcg-integration skill.
         "info:current_player"_.Bind(Spec<int>({}, {0, 1})),
@@ -90,7 +90,9 @@ inline bool IsBypassedSelect(const State& state) {
 }
 
 /**
- * Phases 2-4 (envpool-ptcg-integration skill) are all wired in:
+ * Phases 2-4 (envpool-ptcg-integration skill) are all wired in, plus a
+ * later single-index-action redesign (see CLAUDE.md's "Current focus" /
+ * schema.py's STOP_SLOT/N_OPTION_SLOTS comment):
  *  - Phase 2: real Reset()/Step() flow -- 2-step deck-select handshake into
  *    ApiBattleStart, deviceRand=false throughput fix, real ApiSelect
  *    stepping, IsDone() via state.isFinish().
@@ -102,14 +104,25 @@ inline bool IsBypassedSelect(const State& state) {
  *    (ptcg_encode.h's EncodeObservation, a C++ port of encode.py), not
  *    Zero()'d placeholders. Deck-select steps (and the terminal step -- see
  *    WriteState) still Zero(), since there's no board/decision to encode.
- *  - Phase 4: decide()'s `action` is genuinely interpreted now (illegal-vs-
- *    under-minCount tiering, "Action space" in the skill) instead of Phase
- *    2's self-driven random-legal-pick stand-in; deck-select's illegal-deck
- *    case and decide()'s illegal-action case both apply the same instant-
- *    loss-for-the-offender reward pattern board_games::IllegalRewards uses
- *    (envpool/pgx/board_games.h), adapted to this env's single-reward-per-
- *    step shape (see "Reward" in the skill) instead of that pattern's dual-
- *    player broadcast, which doesn't fit here.
+ *  - decide()'s `action` is a single index per Step() call (only slot 0 of
+ *    the 60-slot action vector is read; the rest are ignored -- the vector
+ *    stays 60-wide only because deck-select needs it), not the up-to-
+ *    maxCount padded list Phase 4 originally used: 0..kMaxOptions-1 picks
+ *    a real state.options row, kStopSlot submits the accumulated selection
+ *    (chosen_) as final. A decision needing multiple picks is therefore
+ *    multiple genuine Step() calls, not one call carrying multiple indices
+ *    -- see LegalActions()/AutoResolveForcedSubPicksThenRespond()/
+ *    FinalizeSelection() below. Any sub-pick where LegalActions() collapses
+ *    to exactly one option (e.g. only one valid card remains, or selectMax
+ *    was just reached so only STOP is legal) is auto-resolved internally,
+ *    generalizing Phase 2.5's whole-decision bypass to intra-decision
+ *    sub-picks -- Python only ever sees a genuine multi-way choice.
+ *    Illegal actions (anything LegalActions() doesn't contain) apply the
+ *    same instant-loss-for-the-offender reward pattern
+ *    board_games::IllegalRewards uses (envpool/pgx/board_games.h), adapted
+ *    to this env's single-reward-per-step shape (see "Reward" in the
+ *    skill) instead of that pattern's dual-player broadcast, which doesn't
+ *    fit here; deck-select's illegal-deck case uses the identical pattern.
  */
 class PtcgEnv : public Env<PtcgEnvSpec> {
  protected:
@@ -120,6 +133,12 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   ApiData* battle_{nullptr};
   std::array<int, kActionSlots> deck0_{};
   std::array<int, kActionSlots> deck1_{};
+  // Real state.options-row indices already picked earlier in the current
+  // decide()-type decision -- reset to empty every time a fresh, non-
+  // bypassed decide() prompt begins (see ResolveBypassedSelectsThenRespond),
+  // accumulated across however many Step() calls that decision takes, and
+  // submitted to the real ApiSelect exactly once, at FinalizeSelection().
+  std::vector<int> chosen_;
 
  public:
   PtcgEnv(const Spec& spec, int env_id) : Env<PtcgEnvSpec>(spec, env_id) {
@@ -159,6 +178,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     is_deck_select_ = true;
     current_player_ = 0;
     finish_reason_ = 0;
+    chosen_.clear();
     WriteState(0.0F);
   }
 
@@ -222,69 +242,113 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   }
 
   void StepDecide(const Action& action) {
-    auto& state = battle_->state;
-    std::vector<int> chosen;
-    for (int i = 0; i < kActionSlots; ++i) {
-      int v = action["action"_][i];
-      if (v != -1) {
-        chosen.push_back(v);
-      }
-    }
-    if (static_cast<int>(chosen.size()) < state.selectMin) {
-      // Under minCount -> pad, don't penalize: production explicitly
-      // tolerates and pads short answers with random remaining valid
-      // indices ("Action space" in the skill, mirroring
-      // main.py:agent()'s own tolerant behavior). gen_ (Env<Spec>'s
-      // per-env RNG) is fine here -- unlike Phase 2.5's prize-select bypass,
-      // there's no production-RNG-parity concern: the policy already made
-      // its intentional picks, this only fills in blanks it declined to
-      // specify.
-      std::vector<int> remaining;
-      for (int i = 0; i < static_cast<int>(state.options.size()); ++i) {
-        if (std::find(chosen.begin(), chosen.end(), i) == chosen.end()) {
-          remaining.push_back(i);
-        }
-      }
-      std::shuffle(remaining.begin(), remaining.end(), gen_);
-      int need = state.selectMin - static_cast<int>(chosen.size());
-      for (int i = 0; i < need && i < static_cast<int>(remaining.size());
-           ++i) {
-        chosen.push_back(remaining[i]);
-      }
-    }
-
-    // Everything else -- out-of-range, exceeds maxCount, duplicate -- is
-    // left for the engine's own state.checkPlayerSelect() (State.h), run at
-    // the top of ApiSelect, rather than re-derived by hand here: reusing
-    // the authoritative check mirrors deck-select's "legality is whatever
-    // ApiBattleStart itself enforces" philosophy ("Action space" in the
-    // skill), and checkPlayerSelect()'s error codes are exactly the
-    // illegal-vs-not distinction that section describes.
-    int error =
-        ApiSelect(battle_, chosen.data(), static_cast<int>(chosen.size()));
-    if (error != 0) {
+    int a = action["action"_][0];
+    std::vector<int> legal = LegalActions();
+    if (std::find(legal.begin(), legal.end(), a) == legal.end()) {
       // Illegal action -> instant loss for the offender (state.selectPlayer,
       // == current_player_, unambiguous here unlike deck-select's
-      // errorPlayer indirection). ApiSelect returns before calling
-      // data->next() on any error (Api.h), so battle_->state is completely
-      // unchanged -- no SyncFromEngine() call, and WriteState correctly
-      // Zero()s the obs rather than re-encoding a decision that never
-      // advanced.
+      // errorPlayer indirection). ApiSelect is never even called on this
+      // path (validated against LegalActions() first), so battle_->state
+      // is completely unchanged -- no SyncFromEngine() call, and WriteState
+      // correctly Zero()s the obs rather than re-encoding a decision that
+      // never advanced.
       done_ = true;
       finish_reason_ = 0;
       WriteState(-1.0F);
       return;
     }
+    if (a == kStopSlot) {
+      FinalizeSelection();
+      return;
+    }
+    chosen_.push_back(a);
+    AutoResolveForcedSubPicksThenRespond();
+  }
+
+  // Single source of truth for "what actions are legal right now", given
+  // battle_->state and chosen_ -- used both to validate an incoming Python
+  // action (StepDecide) and to drive the auto-resolve loop below. A real
+  // option row i is legal iff it's one of the actual state.options
+  // (i < n_real), not already picked, and selectMax hasn't been reached
+  // yet; kStopSlot is legal iff selectMin has been satisfied. Mirrors
+  // encode.py's/ptcg_encode.h's STOP-row is_valid computation exactly (see
+  // schema.py's STOP_SLOT comment) -- same rule, read here for control flow
+  // instead of written into an observation.
+  std::vector<int> LegalActions() const {
+    const auto& state = battle_->state;
+    int n_real = std::min(static_cast<int>(state.options.size()), kMaxOptions);
+    std::vector<int> legal;
+    if (static_cast<int>(chosen_.size()) < state.selectMax) {
+      for (int i = 0; i < n_real; ++i) {
+        if (std::find(chosen_.begin(), chosen_.end(), i) == chosen_.end()) {
+          legal.push_back(i);
+        }
+      }
+    }
+    if (static_cast<int>(chosen_.size()) >= state.selectMin) {
+      legal.push_back(kStopSlot);
+    }
+    return legal;
+  }
+
+  // Runs from the current chosen_ state (either just-appended-by-Python in
+  // StepDecide, or freshly reset for a new decide()-type prompt in
+  // ResolveBypassedSelectsThenRespond): auto-advances through any round
+  // where LegalActions() collapses to exactly one option -- generalizes
+  // the forced-full-select/prize-select whole-decision bypass
+  // (IsBypassedSelect) to intra-decision sub-picks (e.g. "only one valid
+  // card remains" or "selectMax was just reached, only STOP is legal"), so
+  // Python only ever sees a genuine multi-way decide() step, never a
+  // deterministic one. Finalizes (real ApiSelect + recurse into
+  // ResolveBypassedSelectsThenRespond) the instant that happens; otherwise
+  // presents the resulting decision with WriteState(0.0F).
+  void AutoResolveForcedSubPicksThenRespond() {
+    while (true) {
+      std::vector<int> legal = LegalActions();
+      CHECK(!legal.empty())
+          << "no legal action at a decide() sub-pick -- engine invariant "
+             "violated (selectMin exceeds available options?)";
+      if (legal.size() != 1) {
+        break;
+      }
+      if (legal[0] == kStopSlot) {
+        FinalizeSelection();
+        return;
+      }
+      chosen_.push_back(legal[0]);
+    }
+    SyncFromEngine();
+    WriteState(0.0F);
+  }
+
+  // Submits chosen_ as the final answer to this decide()-type selection.
+  // Every constituent pick was already validated against LegalActions()
+  // before being added to chosen_ (either by StepDecide, for a genuine
+  // Python-provided pick, or by AutoResolveForcedSubPicksThenRespond, for
+  // an auto-resolved one), so ApiSelect itself should never reject it --
+  // CHECK_EQ (not a penalized runtime path) mirrors
+  // ResolveBypassedSelectsThenRespond's own bypass-selection assertion:
+  // a failure here means LegalActions() has drifted from the engine's real
+  // state.checkPlayerSelect() rule, a bug to fix, not a real game outcome.
+  void FinalizeSelection() {
+    int error =
+        ApiSelect(battle_, chosen_.data(), static_cast<int>(chosen_.size()));
+    CHECK_EQ(error, 0)
+        << "PtcgEnv's own tracked selection was rejected by ApiSelect -- "
+           "LegalActions() has drifted from the engine's real legality rule";
     ResolveBypassedSelectsThenRespond();
   }
 
   // Runs ApiSelect's own bypass loop forward through any forced-full-select/
   // prize-select decision points (Phase 2.5, "Trajectory & prompt routing"),
-  // then computes the terminal-only reward ("Reward" in the skill) and
-  // writes the response. Shared by both StepDeckSelect's post-ApiBattleStart
-  // path and StepDecide's post-ApiSelect path -- deliberately, since a
-  // just-started battle's first decision point could in principle itself be
-  // bypassed (astronomically unlikely, but free to handle correctly by
+  // then either hands off to a fresh decide()-type prompt's own
+  // auto-resolve loop, or -- if the game ended instead -- computes the
+  // terminal-only reward ("Reward" in the skill) and writes the response.
+  // Shared by StepDeckSelect's post-ApiBattleStart path, StepDecide's
+  // post-illegal-check path (via AutoResolveForcedSubPicksThenRespond /
+  // FinalizeSelection), and FinalizeSelection itself -- deliberately, since
+  // a just-started battle's first decision point could in principle itself
+  // be bypassed (astronomically unlikely, but free to handle correctly by
   // reusing this rather than special-casing it away).
   void ResolveBypassedSelectsThenRespond() {
     while (!battle_->state.isFinish() && IsBypassedSelect(battle_->state)) {
@@ -295,24 +359,31 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
           << "bypass-computed selection was rejected by ApiSelect -- bug in "
              "the Phase 2.5 bypass logic, not a real scenario";
     }
-    float reward = 0.0F;
-    if (battle_->state.isFinish()) {
-      // "Reward" in the skill: state.apiResult() (-1/0/1/2), not a raw
-      // GameResult cast. For *that step's player* (state.selectPlayer):
-      // +1.0 if apiResult()==selectPlayer, -1.0 if it's the other player's
-      // index, 0.0 on draw.
-      int result = battle_->state.apiResult();
-      int actor = battle_->state.selectPlayer;
-      if (result != 2) {
-        reward = (result == actor) ? 1.0F : -1.0F;
-      }
-      // Real engine-side finish -- state.finishCheck() has already run
-      // (called internally by ApiSelect/data->next()) and set finishReason,
-      // so this is the one place a non-zero value is ever recorded.
-      finish_reason_ = static_cast<int>(battle_->state.finishReason);
-    } else {
+    if (!battle_->state.isFinish()) {
+      // A fresh, non-bypassed decide()-type prompt: reset the per-decision
+      // pick accumulator and let AutoResolveForcedSubPicksThenRespond
+      // either settle immediately (e.g. exactly one valid option with
+      // selectMin==selectMax==1 -- this whole decision has only one legal
+      // path start-to-finish) or present a genuine choice.
       finish_reason_ = 0;
+      chosen_.clear();
+      AutoResolveForcedSubPicksThenRespond();
+      return;
     }
+    // "Reward" in the skill: state.apiResult() (-1/0/1/2), not a raw
+    // GameResult cast. For *that step's player* (state.selectPlayer):
+    // +1.0 if apiResult()==selectPlayer, -1.0 if it's the other player's
+    // index, 0.0 on draw.
+    float reward = 0.0F;
+    int result = battle_->state.apiResult();
+    int actor = battle_->state.selectPlayer;
+    if (result != 2) {
+      reward = (result == actor) ? 1.0F : -1.0F;
+    }
+    // Real engine-side finish -- state.finishCheck() has already run
+    // (called internally by ApiSelect/data->next()) and set finishReason,
+    // so this is the one place a non-zero value is ever recorded.
+    finish_reason_ = static_cast<int>(battle_->state.finishReason);
     SyncFromEngine();
     WriteState(reward);
   }
@@ -328,8 +399,9 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     // battle's own per-instance RNG (battle_->game.rng) rather than gen_
     // (Env<Spec>'s per-env RNG) -- "Trajectory & prompt routing" in the
     // skill: this needs to be consistent with the rest of *that battle's*
-    // randomness for production parity, unlike StepDecide's under-minCount
-    // padding above, which has no such parity concern.
+    // randomness for production parity, unlike LegalActions()-driven
+    // auto-resolution above, which has no such parity concern (it only
+    // ever narrows to a single legal choice, nothing to randomize).
     std::vector<int> indices(state.options.size());
     std::iota(indices.begin(), indices.end(), 0);
     std::shuffle(indices.begin(), indices.end(), battle_->game.rng);
@@ -371,7 +443,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
       // be cleared by then -- see ptcg_encode.h's EncodeObservation doc
       // comment).
       const auto& deck = current_player_ == 0 ? deck0_ : deck1_;
-      EncodeObservation(battle_->state, deck, state["obs:cards"_],
+      EncodeObservation(battle_->state, deck, chosen_, state["obs:cards"_],
                         state["obs:pokemons"_], state["obs:player_state"_],
                         state["obs:state"_], state["obs:select"_],
                         state["obs:options"_]);

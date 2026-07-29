@@ -25,9 +25,9 @@ using PtcgState = typename ptcg::PtcgEnv::State;
 // Phase 4 test (envpool-ptcg-integration skill): the two illegal-action
 // penalty paths ("Action space" / "Reward" in the skill) that
 // ptcg_envpool_test.cc's happy-path test never exercises, since every
-// action it sends is legal by construction (a real deck, or a -1-filled
-// dummy that under-minCount padding turns into a legal pick). Both single-
-// env, single-scripted-scenario tests (num_envs=1) -- sequencing/ring-buffer
+// action it sends there is legal by construction (a real deck, or a real
+// option row read off the just-observed obs:options). Both single-env,
+// single-scripted-scenario tests (num_envs=1) -- sequencing/ring-buffer
 // coverage across many envs and real games is ptcg_envpool_test.cc's job,
 // this file only needs to prove the penalty wiring itself.
 namespace {

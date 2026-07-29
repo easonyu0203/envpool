@@ -152,11 +152,13 @@ inline void WriteRow(int* base, std::initializer_list<int> values) {
  */
 class ObservationEncoder {
  public:
-  ObservationEncoder(const State& state, const std::array<int, kActionSlots>& my_deck)
+  ObservationEncoder(const State& state, const std::array<int, kActionSlots>& my_deck,
+                      const std::vector<int>& already_selected)
       : state_(state),
         your_index_(state.selectPlayer),
         opp_index_(1 - state.selectPlayer),
-        my_deck_(my_deck) {}
+        my_deck_(my_deck),
+        already_selected_(already_selected) {}
 
   void Encode(const Array& cards_arr, const Array& pokemons_arr,
               const Array& player_state_arr, const Array& state_arr,
@@ -175,6 +177,13 @@ class ObservationEncoder {
   int your_index_;
   int opp_index_;
   const std::array<int, kActionSlots>& my_deck_;
+  // Indices into state_.options already picked earlier in the current
+  // multi-pick decision (empty on that decision's first call) -- caller-
+  // tracked bookkeeping (PtcgEnv's chosen_), not derived from state_ itself.
+  // Drives WriteOptions's per-row already_selected column and the
+  // engine-appended STOP row's is_valid -- see schema.py's
+  // STOP_SLOT/N_OPTION_SLOTS comment and encode.py's mirror of this.
+  const std::vector<int>& already_selected_;
 
   std::unordered_map<int, CardLoc> loc_by_serial_;
   std::vector<CardLoc> mine_rows_;
@@ -650,7 +659,7 @@ class ObservationEncoder {
 
   // --- options tensor ---
 
-  void EncodeOption(const SelectOption& opt, int* row_arr) {
+  void EncodeOption(const SelectOption& opt, int* row_arr, int already_selected) {
     int number = 0;
     int number_valid = 0;
     int count = 0;
@@ -731,7 +740,7 @@ class ObservationEncoder {
     // is_valid, type, number, number_valid, count, count_valid,
     // special_condition_type, special_condition_type_valid, attack_id, attack_id_valid,
     // card_{valid,is_me,pokemon_pos,area,pos_in_area,id},
-    // pokemon_{valid,is_me,pos}
+    // pokemon_{valid,is_me,pos}, already_selected
     WriteRow(row_arr, {
       1, static_cast<int>(ot),
       number, number_valid,
@@ -740,6 +749,7 @@ class ObservationEncoder {
       attack_id, attack_id_valid,
       card.valid, card.is_me, card.pokemon_pos, card.area, card.pos_in_area, card.id,
       pokemon.valid, pokemon.is_me, pokemon.pos,
+      already_selected,
     });
   }
 
@@ -747,10 +757,33 @@ class ObservationEncoder {
     auto* base = static_cast<int*>(options_arr.Data());
     int n = std::min(static_cast<int>(state_.options.size()), kMaxOptions);
     for (int i = 0; i < n; ++i) {
-      EncodeOption(state_.options[i], base + i * kOptionsCols);
+      int picked = (std::find(already_selected_.begin(), already_selected_.end(), i) !=
+                    already_selected_.end())
+                       ? 1
+                       : 0;
+      EncodeOption(state_.options[i], base + i * kOptionsCols, picked);
     }
     // Rows [n, kMaxOptions) stay at the Zero()'d default -- see WriteCards's
     // closing comment; same caller contract.
+
+    // STOP row (schema.py's STOP_SLOT/N_OPTION_SLOTS): engine-appended, not
+    // a real state_.options entry -- is_valid directly encodes whether
+    // stopping is currently legal (picks-so-far >= selectMin), no separate
+    // comparison needed by any downstream consumer. already_selected is
+    // always 0 -- STOP can't itself have been "already picked" (picking it
+    // ends the decision). Mirrors encode.py's STOP row exactly.
+    bool can_stop = static_cast<int>(already_selected_.size()) >= state_.selectMin;
+    int* stop_row = base + kStopSlot * kOptionsCols;
+    WriteRow(stop_row, {
+      can_stop ? 1 : 0, kStopOptionType,
+      0, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      kNoCardPtr.valid, kNoCardPtr.is_me, kNoCardPtr.pokemon_pos, kNoCardPtr.area, kNoCardPtr.pos_in_area, kNoCardPtr.id,
+      kNoPokemonPtr.valid, kNoPokemonPtr.is_me, kNoPokemonPtr.pos,
+      0,
+    });
   }
 };
 
@@ -761,12 +794,18 @@ class ObservationEncoder {
 // non-empty) -- exactly encode_observation()'s own documented precondition.
 // `my_deck` is the persistent per-seat deck cache (PtcgEnv's deck0_/deck1_),
 // standing in for production's `get_deck()`/`@lru_cache` (see "Persistent
-// per-seat deck cache" in the skill).
+// per-seat deck cache" in the skill). `already_selected` is
+// PtcgEnv's own chosen_ accumulator -- indices into state.options already
+// picked earlier in the current multi-pick decision (empty on that
+// decision's first call); mirrors encode.py's `encode_observation`'s
+// `already_selected` parameter exactly, see schema.py's
+// STOP_SLOT/N_OPTION_SLOTS comment for what it drives.
 inline void EncodeObservation(const State& state, const std::array<int, kActionSlots>& my_deck,
+                               const std::vector<int>& already_selected,
                                const Array& cards_arr, const Array& pokemons_arr,
                                const Array& player_state_arr, const Array& state_arr,
                                const Array& select_arr, const Array& options_arr) {
-  detail::ObservationEncoder(state, my_deck)
+  detail::ObservationEncoder(state, my_deck, already_selected)
       .Encode(cards_arr, pokemons_arr, player_state_arr, state_arr, select_arr, options_arr);
 }
 
