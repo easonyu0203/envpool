@@ -49,7 +49,7 @@ namespace {
 
 struct FixtureCase {
   std::string base64;
-  std::array<int, ptcg::kActionSlots> my_deck{};
+  std::array<int, ptcg::kDeckSize> my_deck{};
   std::vector<int> already_selected;  // indices into select.option, see generate_ptcg_encode_fixtures.py
   std::vector<int> cards, pokemons, player_state, state, select, options;
 };

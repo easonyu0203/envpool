@@ -279,15 +279,16 @@ void CheckStructuralInvariants(const PtcgState& state, int slot) {
 
 // Drives real games (num_envs == batch_size, sync mode) and runs the
 // structural checks above on every decide()-step observation encountered --
-// deck-select steps are skipped (all-zero by design, nothing to check) via
-// the same episode_step/is_deck_select bookkeeping ptcg_envpool_test.cc
-// uses. Stops once every env has completed at least one full episode.
+// the terminal step is skipped (all-zero by design, nothing to check).
+// Stops once every env has completed at least one full episode.
 TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
   auto config = ptcg::PtcgEnvSpec::kDefaultConfig;
   const int num_envs = 2;
   config["num_envs"_] = num_envs;
   config["batch_size"_] = num_envs;
   config["num_threads"_] = 1;
+  config["deck0"_] = std::vector<int>(kDeck.begin(), kDeck.end());
+  config["deck1"_] = std::vector<int>(kDeck.begin(), kDeck.end());
   ptcg::PtcgEnvSpec spec(config);
   ptcg::PtcgEnvPool envpool(spec);
 
@@ -298,11 +299,10 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
   envpool.Reset(all_env_ids);
 
   struct EnvTrack {
-    bool is_deck_select = true;
     bool done = false;
     bool completed_once = false;
     int checked_decide_steps = 0;
-    std::vector<int> last_options;  // valid only when !is_deck_select && !done
+    std::vector<int> last_options;  // valid only when !done
   };
   std::vector<EnvTrack> track(num_envs);
 
@@ -311,14 +311,12 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
     for (int i = 0; i < num_envs; ++i) {
       int env_id = static_cast<int>(state["info:env_id"_][i]);
       EnvTrack& t = track[env_id];
-      bool is_deck_select = static_cast<bool>(state["info:is_deck_select"_][i]);
       bool done = static_cast<bool>(state["done"_][i]);
-      if (!is_deck_select && !done) {
+      if (!done) {
         CheckStructuralInvariants(state, i);
         t.checked_decide_steps++;
         t.last_options = CopyOptions(TArray<int>(state["obs:options"_][i]));
       }
-      t.is_deck_select = is_deck_select;
       t.done = done;
       if (done) {
         t.completed_once = true;
@@ -337,25 +335,15 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
   while (!all_completed()) {
     ASSERT_LT(round, kMaxRounds);
     ++round;
-    std::vector<Array> raw_action(
-        {Array(Spec<int>({num_envs})), Array(Spec<int>({num_envs})),
-         Array(Spec<int>({num_envs, ptcg::kActionSlots}))});
+    std::vector<Array> raw_action({Array(Spec<int>({num_envs})),
+                                    Array(Spec<int>({num_envs})),
+                                    Array(Spec<int>({num_envs}))});
     PtcgAction action(raw_action);
     for (int i = 0; i < num_envs; ++i) {
       action["env_id"_][i] = i;
       action["players.env_id"_][i] = i;
       EnvTrack& t = track[i];
-      bool send_real_deck = !t.done && t.is_deck_select;
-      int first_slot = -1;
-      if (send_real_deck) {
-        first_slot = kDeck[0];
-      } else if (!t.done) {
-        first_slot = PickLegalAction(t.last_options);
-      }
-      action["action"_][i][0] = first_slot;
-      for (int j = 1; j < ptcg::kActionSlots; ++j) {
-        action["action"_][i][j] = send_real_deck ? kDeck[j] : -1;
-      }
+      action["action"_][i] = t.done ? 0 : PickLegalAction(t.last_options);
     }
     envpool.Send(action);
     recv_and_check();

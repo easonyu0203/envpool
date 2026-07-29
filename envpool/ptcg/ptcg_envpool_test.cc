@@ -60,11 +60,9 @@ constexpr std::array<int, 60> kDeck = {
 };
 
 struct EnvTrack {
-  bool is_deck_select = true;
   bool done = false;
-  int episode_step = 0;  // resets to 0 whenever a fresh episode begins
   bool completed_once = false;
-  std::vector<int> last_options;  // valid only when !is_deck_select && !done
+  std::vector<int> last_options;  // valid only when !done
 };
 
 // Copies an obs:options view into stable storage -- the Array it wraps is a
@@ -115,19 +113,19 @@ int PickLegalAction(const std::vector<int>& options_flat) {
 // Real games are nondeterministic in length and first-player assignment (see
 // "Resets are nondeterministic" in the skill -- ApiBattleStart has no seed
 // parameter), so unlike Phase 1's exact-sequence table, this asserts
-// structural invariants across full real episodes: deck-select is always
-// exactly the first 2 steps of an episode with current_player 0 then 1;
-// decide() steps keep current_player in {0,1}; obs tensors are all-zero on
-// deck-select/terminal steps and non-trivial (real encoder output, Phase 3)
-// on decide() steps; reward is 0.0 except on the step done becomes true,
-// where it's the real apiResult()-derived terminal reward (Phase 4) --
-// every action sent here is always legal (a real deck, or a real option
-// row read off the just-observed obs:options and picked by
-// PickLegalAction(), see its comment), so this test's games always end via
-// genuine win/loss/draw, never the illegal-action penalty path (see
-// ptcg_envpool_illegal_test.cc for that); every env eventually reaches
-// done. Same "diff structurally, not bit-exact" adjustment Phase 0 already
-// made for the same underlying reason.
+// structural invariants across full real episodes: Reset()'s own response is
+// already a real decide()-type observation (decks are config now, see
+// ptcg_envpool.h's DefaultConfig -- no more deck-select trajectory step);
+// decide() steps keep current_player in {0,1}; obs tensors are all-zero only
+// on the terminal step and non-trivial (real encoder output, Phase 3)
+// otherwise; reward is 0.0 except on the step done becomes true, where it's
+// the real apiResult()-derived terminal reward (Phase 4) -- every action
+// sent here is always a real option row read off the just-observed
+// obs:options and picked by PickLegalAction() (see its comment), so this
+// test's games always end via genuine win/loss/draw, never the
+// illegal-action penalty path (see ptcg_envpool_illegal_test.cc for that);
+// every env eventually reaches done. Same "diff structurally, not bit-exact"
+// adjustment Phase 0 already made for the same underlying reason.
 //
 // num_envs == batch_size == 3 (sync mode): real games run dozens+ of
 // decide() calls each, which alone cycles every StateBuffer ring-buffer slot
@@ -146,6 +144,8 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
   config["num_envs"_] = num_envs;
   config["batch_size"_] = num_envs;
   config["num_threads"_] = 1;
+  config["deck0"_] = std::vector<int>(kDeck.begin(), kDeck.end());
+  config["deck1"_] = std::vector<int>(kDeck.begin(), kDeck.end());
   ptcg::PtcgEnvSpec spec(config);
   ptcg::PtcgEnvPool envpool(spec);
 
@@ -163,14 +163,12 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       int env_id = static_cast<int>(state["info:env_id"_][i]);
       EnvTrack& t = track[env_id];
 
-      bool is_deck_select =
-          static_cast<bool>(state["info:is_deck_select"_][i]);
       int current_player = static_cast<int>(state["info:current_player"_][i]);
       bool done = static_cast<bool>(state["done"_][i]);
       float reward = static_cast<float>(state["reward"_][i]);
       int finish_reason = static_cast<int>(state["info:finish_reason"_][i]);
 
-      if (is_deck_select || done) {
+      if (done) {
         ExpectAllZero(state["obs:cards"_][i]);
         ExpectAllZero(state["obs:pokemons"_][i]);
         ExpectAllZero(state["obs:player_state"_][i]);
@@ -198,27 +196,17 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
         EXPECT_EQ(finish_reason, 0) << "env_id=" << env_id;
       }
 
-      EXPECT_EQ(is_deck_select, t.episode_step < 2)
-          << "env_id=" << env_id << " episode_step=" << t.episode_step;
-      if (t.episode_step == 0) {
-        EXPECT_EQ(current_player, 0) << "env_id=" << env_id;
-      } else if (t.episode_step == 1) {
-        EXPECT_EQ(current_player, 1) << "env_id=" << env_id;
-      } else {
-        EXPECT_GE(current_player, 0) << "env_id=" << env_id;
-        EXPECT_LE(current_player, 1) << "env_id=" << env_id;
-      }
+      EXPECT_GE(current_player, 0) << "env_id=" << env_id;
+      EXPECT_LE(current_player, 1) << "env_id=" << env_id;
 
-      t.is_deck_select = is_deck_select;
       t.done = done;
-      ++t.episode_step;
       if (done) {
         t.completed_once = true;
       }
     }
   };
 
-  recv_and_check();  // Reset()'s output: player-0 deck-select, every env.
+  recv_and_check();  // Reset()'s output: every env's first real decide().
 
   const int kMaxRounds = 20000;
   int round = 0;
@@ -231,9 +219,9 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
         << "not every env reached done within the safety bound";
     ++round;
 
-    std::vector<Array> raw_action(
-        {Array(Spec<int>({num_envs})), Array(Spec<int>({num_envs})),
-         Array(Spec<int>({num_envs, ptcg::kActionSlots}))});
+    std::vector<Array> raw_action({Array(Spec<int>({num_envs})),
+                                    Array(Spec<int>({num_envs})),
+                                    Array(Spec<int>({num_envs}))});
     PtcgAction action(raw_action);
     for (int i = 0; i < num_envs; ++i) {
       action["env_id"_][i] = i;
@@ -241,22 +229,9 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       EnvTrack& t = track[i];
       // A `done` env's next Send() triggers AsyncEnvPool's internal
       // auto-reset (see this test's top comment) -- content is irrelevant
-      // for that slot this round, it starts a fresh episode's deck-select
-      // regardless of what's sent.
-      bool send_real_deck = !t.done && t.is_deck_select;
-      int first_slot = -1;
-      if (send_real_deck) {
-        first_slot = kDeck[0];
-      } else if (!t.done) {
-        first_slot = PickLegalAction(t.last_options);
-      }
-      action["action"_][i][0] = first_slot;
-      for (int j = 1; j < ptcg::kActionSlots; ++j) {
-        action["action"_][i][j] = send_real_deck ? kDeck[j] : -1;
-      }
-      if (t.done) {
-        t.episode_step = 0;  // about to start a fresh episode
-      }
+      // for that slot this round, it starts a fresh episode regardless of
+      // what's sent.
+      action["action"_][i] = t.done ? 0 : PickLegalAction(t.last_options);
     }
     envpool.Send(action);
     recv_and_check();

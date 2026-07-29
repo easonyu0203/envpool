@@ -65,11 +65,10 @@ constexpr int kOptionRows = kMaxOptions + 1;
 // literal, cross-checked against ApiType.h's SelectOptionType by hand.
 constexpr int kStopOptionType = 17;
 
-// Deck-select and decide() share one action shape (see "Action space" in the
-// envpool-ptcg-integration skill): 60 slots, all real values (card ids) for
-// deck-select; decide() only ever reads slot 0 -- one option-row index
-// (0..kMaxOptions-1) or kStopSlot for STOP -- the rest are ignored padding.
-constexpr int kActionSlots = 60;
+// A single deck's card count -- both configured decks (`deck0`/`deck1`
+// config keys, see ptcg_envpool.h) are exactly this many card ids, and
+// ApiBattleStart's `cards` argument is two of these concatenated.
+constexpr int kDeckSize = 60;
 
 }  // namespace ptcg
 

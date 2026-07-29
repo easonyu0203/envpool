@@ -73,7 +73,7 @@ struct Encoded {
   // empty) -- this test is about raw engine/encoder determinism given
   // identical inputs, not about exercising PtcgEnv's own per-index
   // accumulation (that's ptcg_envpool_test.cc's job).
-  static Encoded From(const State& state, const std::array<int, ptcg::kActionSlots>& deck) {
+  static Encoded From(const State& state, const std::array<int, ptcg::kDeckSize>& deck) {
     Encoded e;
     ptcg::EncodeObservation(state, deck, {}, e.cards, e.pokemons, e.player_state,
                             e.state, e.select, e.options);

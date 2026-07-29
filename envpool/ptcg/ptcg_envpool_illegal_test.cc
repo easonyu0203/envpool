@@ -22,14 +22,21 @@
 using PtcgAction = typename ptcg::PtcgEnv::Action;
 using PtcgState = typename ptcg::PtcgEnv::State;
 
-// Phase 4 test (envpool-ptcg-integration skill): the two illegal-action
-// penalty paths ("Action space" / "Reward" in the skill) that
+// Phase 4 test (envpool-ptcg-integration skill): the illegal-decide-action
+// penalty path ("Action space" / "Reward" in the skill) that
 // ptcg_envpool_test.cc's happy-path test never exercises, since every
-// action it sends there is legal by construction (a real deck, or a real
-// option row read off the just-observed obs:options). Both single-env,
-// single-scripted-scenario tests (num_envs=1) -- sequencing/ring-buffer
-// coverage across many envs and real games is ptcg_envpool_test.cc's job,
-// this file only needs to prove the penalty wiring itself.
+// action it sends there is legal by construction (a real option row read
+// off the just-observed obs:options). Single-env, single-scripted-scenario
+// test (num_envs=1) -- sequencing/ring-buffer coverage across many envs and
+// real games is ptcg_envpool_test.cc's job, this file only needs to prove
+// the penalty wiring itself.
+//
+// The old sibling "illegal deck" test (an adversarial per-episode deck-
+// select action naming a nonexistent card id) is gone: decks are fixed
+// EnvPool-lifetime config now (see ptcg_envpool.h's DefaultConfig), not an
+// action a policy submits per episode, so that scenario is structurally
+// unreachable -- an invalid configured deck now CHECK-fails Reset()
+// (a construction/config bug, not a per-episode reward-penalty condition).
 namespace {
 
 // Same real, deck-legal 60-card list as ptcg_envpool_test.cc /
@@ -50,98 +57,45 @@ void ExpectAllZero(const Array& arr) {
   }
 }
 
-// Single-env send/recv helper shared by both tests below.
-PtcgState Send(ptcg::PtcgEnvPool& envpool,  // NOLINT
-                const std::array<int, ptcg::kActionSlots>& slots) {
-  std::vector<Array> raw_action(
-      {Array(Spec<int>({1})), Array(Spec<int>({1})),
-       Array(Spec<int>({1, ptcg::kActionSlots}))});
+// Single-env send/recv helper.
+PtcgState Send(ptcg::PtcgEnvPool& envpool, int action_value) {  // NOLINT
+  std::vector<Array> raw_action({Array(Spec<int>({1})), Array(Spec<int>({1})),
+                                  Array(Spec<int>({1}))});
   PtcgAction action(raw_action);
   action["env_id"_][0] = 0;
   action["players.env_id"_][0] = 0;
-  for (int j = 0; j < ptcg::kActionSlots; ++j) {
-    action["action"_][0][j] = slots[j];
-  }
+  action["action"_][0] = action_value;
   envpool.Send(action);
   return PtcgState(envpool.Recv());
 }
 
 }  // namespace
 
-TEST(PtcgEnvPoolIllegalTest, IllegalDeckPenalizesOffendingSeat) {
-  auto config = ptcg::PtcgEnvSpec::kDefaultConfig;
-  config["num_envs"_] = 1;
-  config["batch_size"_] = 1;
-  config["num_threads"_] = 1;
-  ptcg::PtcgEnvSpec spec(config);
-  ptcg::PtcgEnvPool envpool(spec);
-
-  Array env_ids(Spec<int>({1}));
-  env_ids[0] = 0;
-  envpool.Reset(env_ids);
-  PtcgState state(envpool.Recv());  // seat-0 deck-select prompt
-  EXPECT_TRUE(static_cast<bool>(state["info:is_deck_select"_][0]));
-  EXPECT_EQ(static_cast<int>(state["info:current_player"_][0]), 0);
-
-  state = Send(envpool, kDeck);  // seat 0's real, legal deck
-  EXPECT_TRUE(static_cast<bool>(state["info:is_deck_select"_][0]));
-  EXPECT_EQ(static_cast<int>(state["info:current_player"_][0]), 1);
-
-  // Seat 1's deck: an id that doesn't exist in CardTable at all --
-  // ApiBattleStart's very first per-card check (Api.h: `if
-  // (!CardTable.contains(id)) return {nullptr, i, 1}`), deliberately
-  // illegal, no dependency on any specific card's type/count rules.
-  std::array<int, ptcg::kActionSlots> bad_deck{};
-  bad_deck.fill(999999);
-  state = Send(envpool, bad_deck);
-
-  EXPECT_TRUE(static_cast<bool>(state["done"_][0]));
-  EXPECT_FLOAT_EQ(static_cast<float>(state["reward"_][0]), -1.0F);
-  EXPECT_EQ(static_cast<int>(state["info:current_player"_][0]), 1)
-      << "errorPlayer should name seat 1: both decks are only validated "
-         "once ApiBattleStart actually runs, which happens on seat 1's "
-         "Step() (see StepDeckSelect's comment on this)";
-  EXPECT_EQ(static_cast<int>(state["info:finish_reason"_][0]), 0)
-      << "an illegal deck never reaches the engine's own finishCheck()";
-  ExpectAllZero(state["obs:cards"_][0]);
-  ExpectAllZero(state["obs:pokemons"_][0]);
-  ExpectAllZero(state["obs:player_state"_][0]);
-  ExpectAllZero(state["obs:state"_][0]);
-  ExpectAllZero(state["obs:select"_][0]);
-  ExpectAllZero(state["obs:options"_][0]);
-}
-
 TEST(PtcgEnvPoolIllegalTest, IllegalDecideActionPenalizesActor) {
   auto config = ptcg::PtcgEnvSpec::kDefaultConfig;
   config["num_envs"_] = 1;
   config["batch_size"_] = 1;
   config["num_threads"_] = 1;
+  config["deck0"_] = std::vector<int>(kDeck.begin(), kDeck.end());
+  config["deck1"_] = std::vector<int>(kDeck.begin(), kDeck.end());
   ptcg::PtcgEnvSpec spec(config);
   ptcg::PtcgEnvPool envpool(spec);
 
   Array env_ids(Spec<int>({1}));
   env_ids[0] = 0;
   envpool.Reset(env_ids);
-  envpool.Recv();  // Reset()'s own response (seat-0 deck-select prompt) --
-                    // must be drained before the Send()/Recv() pairs below,
-                    // or every round after it reads one round stale.
-
-  Send(envpool, kDeck);                    // seat 0's deck
-  PtcgState state = Send(envpool, kDeck);  // seat 1's deck -> ApiBattleStart
-  // Phase 2.5's bypass loop guarantees whatever's pending now is a genuine,
-  // non-bypassed decision -- safe to answer illegally on purpose.
-  EXPECT_FALSE(static_cast<bool>(state["info:is_deck_select"_][0]));
+  // Reset()'s own response is already a genuine, non-bypassed decide()
+  // prompt (decks are config now -- ApiBattleStart + Phase 2.5's bypass
+  // loop both run inside Reset() itself) -- safe to answer illegally on
+  // purpose right away.
+  PtcgState state(envpool.Recv());
   int actor_before = static_cast<int>(state["info:current_player"_][0]);
 
-  std::array<int, ptcg::kActionSlots> bad_action{};
-  bad_action.fill(-1);
-  // Safely within ActionSpec's declared bound ({-1, N_CARD_IDS-1}) but
-  // essentially certain to exceed the real state.options.size() for any
-  // early-game decision -- an out-of-range pick, per "Action space" in the
-  // skill: "any non--1 entry ... pointing at an options row not marked
-  // valid".
-  bad_action[0] = 500;
-  state = Send(envpool, bad_action);
+  // Within ActionSpec's declared bound ({0, kMaxOptions}) -- a real
+  // option-row index, just not one that exists yet -- but essentially
+  // certain to exceed the real state.options.size() for any early-game
+  // decision, per "Action space" in the skill.
+  state = Send(envpool, ptcg::kMaxOptions - 1);
 
   EXPECT_TRUE(static_cast<bool>(state["done"_][0]));
   EXPECT_FLOAT_EQ(static_cast<float>(state["reward"_][0]), -1.0F);

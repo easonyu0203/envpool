@@ -25,12 +25,13 @@ test in this package. See "Build path" in the skill for the
 `envpool.ptcg.registration` + `envpool.registration.make` access pattern
 this reuses.
 
-Self-play policy: every action sent is legal by construction -- a real deck
-during deck-select, or a -1-filled dummy during decide() that Phase 4's
-under-minCount padding always turns into a legal random pick. Same policy
-shape research/env_speed/bench.py's baseline uses (uniformly random among
-valid options), so the two numbers are a fair throughput comparison even
-though neither is a trained policy.
+Self-play policy: every action sent is a uniformly random pick among the
+just-observed obs:options' legal (is_valid && !already_selected) rows --
+decks are fixed EnvPool-lifetime config now (see ptcg_envpool.h's
+DefaultConfig), not a per-episode action, so there's no more deck-select
+branch to special-case. Same policy shape research/env_speed/bench.py's
+baseline uses (uniformly random among valid options), so the two numbers
+are a fair throughput comparison even though neither is a trained policy.
 
 --batch-size controls async overlap: batch_size == num_envs (the default,
 one entry per --num-envs value) is fully synchronous -- every round waits
@@ -67,9 +68,10 @@ import numpy as np
 import envpool.ptcg.registration  # noqa: F401 -- side effect: registers "Ptcg-v0"
 from envpool.registration import make  # NOT `envpool.make` -- see "Build path" in the skill
 
-_ACTION_SLOTS = 60
 # Same real, deck-legal 60-card list used throughout this package's tests
-# (submissions/sample_submission/deck.csv).
+# (submissions/sample_submission/deck.csv). Both seats use it -- passed as
+# `deck0`/`deck1` config, fixed for the whole EnvPool's lifetime (see
+# ptcg_envpool.h's DefaultConfig).
 _DECK = [
     1158, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 1145,
     1145, 1145, 1145, 1205, 1205, 1227, 1227, 1227, 1227, 1235, 1235, 1235,
@@ -77,6 +79,26 @@ _DECK = [
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 ]
+
+_OPT_IS_VALID_COL = 0  # OPTIONS_COLUMNS[0], see schema.py
+_OPT_ALREADY_SELECTED_COL = 19  # OPTIONS_COLUMNS[-1], see schema.py
+
+_rng = np.random.default_rng()
+
+
+def _random_legal_actions(options: np.ndarray) -> np.ndarray:
+    """options: (batch, 64, 20) raw obs:options. One uniformly random legal
+    (is_valid && !already_selected) row index per env -- see
+    ptcg_py_envpool_test.py's _pick_legal_action for why every genuine
+    decide()-step observation is guaranteed to offer at least one."""
+    actions = np.empty(options.shape[0], dtype=np.int32)
+    for i in range(options.shape[0]):
+        legal = np.flatnonzero(
+            (options[i, :, _OPT_IS_VALID_COL] == 1) &
+            (options[i, :, _OPT_ALREADY_SELECTED_COL] == 0)
+        )
+        actions[i] = _rng.choice(legal)
+    return actions
 
 
 def _git_commit() -> str | None:
@@ -116,18 +138,15 @@ def _gymnasium_stepper(num_envs: int, batch_size: int, num_threads: int):
     """
     env = make(
         "Ptcg-v0", env_type="gymnasium", num_envs=num_envs, batch_size=batch_size,
-        num_threads=num_threads,
+        num_threads=num_threads, deck0=_DECK, deck1=_DECK,
     )
-    dummy_action = np.full((batch_size, _ACTION_SLOTS), -1, dtype=np.int32)
-    deck_action = np.tile(_DECK, (batch_size, 1)).astype(np.int32)
 
     env.async_reset()
 
     def step_once() -> int:
-        _obs, _reward, terminated, _truncated, info = env.recv()
+        obs, _reward, terminated, _truncated, info = env.recv()
         env_id = info["env_id"]
-        is_deck_select = info["is_deck_select"]
-        action = np.where(is_deck_select[:, None], deck_action, dummy_action)
+        action = _random_legal_actions(obs["options"])
         env.send(action, env_id)
         return int(terminated.sum())
 
@@ -157,7 +176,10 @@ def _raw_api_stepper(num_envs: int, batch_size: int, num_threads: int):
     conf = dict(
         zip(_PtcgEnvSpec._config_keys, _PtcgEnvSpec._default_config_values, strict=False)
     )
-    conf.update(num_envs=num_envs, batch_size=num_envs, num_threads=num_threads)
+    conf.update(
+        num_envs=num_envs, batch_size=num_envs, num_threads=num_threads,
+        deck0=_DECK, deck1=_DECK,
+    )
     env_spec = _PtcgEnvSpec(tuple(conf.values()))
     env = _PtcgEnvPool(env_spec)
     state_keys = env._state_keys
@@ -166,19 +188,14 @@ def _raw_api_stepper(num_envs: int, batch_size: int, num_threads: int):
     def recv_dict() -> dict:
         return dict(zip(state_keys, env._recv(), strict=False))
 
-    dummy_action = np.full((num_envs, _ACTION_SLOTS), -1, dtype=np.int32)
-    deck_action = np.tile(_DECK, (num_envs, 1)).astype(np.int32)
-
     env._reset(env_id)
     state = recv_dict()
-    is_deck_select = state["info:is_deck_select"]
 
     def step_once() -> int:
-        nonlocal is_deck_select
-        action = np.where(is_deck_select[:, None], deck_action, dummy_action)
+        nonlocal state
+        action = _random_legal_actions(np.asarray(state["obs:options"]))
         env._send((env_id, env_id, action))
         state = recv_dict()
-        is_deck_select = state["info:is_deck_select"]
         return int(state["done"].sum())
 
     return step_once

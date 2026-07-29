@@ -152,7 +152,7 @@ inline void WriteRow(int* base, std::initializer_list<int> values) {
  */
 class ObservationEncoder {
  public:
-  ObservationEncoder(const State& state, const std::array<int, kActionSlots>& my_deck,
+  ObservationEncoder(const State& state, const std::array<int, kDeckSize>& my_deck,
                       const std::vector<int>& already_selected)
       : state_(state),
         your_index_(state.selectPlayer),
@@ -176,7 +176,7 @@ class ObservationEncoder {
   const State& state_;
   int your_index_;
   int opp_index_;
-  const std::array<int, kActionSlots>& my_deck_;
+  const std::array<int, kDeckSize>& my_deck_;
   // Indices into state_.options already picked earlier in the current
   // multi-pick decision (empty on that decision's first call) -- caller-
   // tracked bookkeeping (PtcgEnv's chosen_), not derived from state_ itself.
@@ -800,7 +800,7 @@ class ObservationEncoder {
 // decision's first call); mirrors encode.py's `encode_observation`'s
 // `already_selected` parameter exactly, see schema.py's
 // STOP_SLOT/N_OPTION_SLOTS comment for what it drives.
-inline void EncodeObservation(const State& state, const std::array<int, kActionSlots>& my_deck,
+inline void EncodeObservation(const State& state, const std::array<int, kDeckSize>& my_deck,
                                const std::vector<int>& already_selected,
                                const Array& cards_arr, const Array& pokemons_arr,
                                const Array& player_state_arr, const Array& state_arr,
