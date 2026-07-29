@@ -48,6 +48,18 @@ constexpr std::array<int, 60> kDeck = {
     3,    3,    3,    3,    3,    3,    3,    3,    3,    3,    3,    3,
 };
 
+// Repeats a 60-card deck num_envs times, flattened -- the shape
+// ptcg_envpool.h's DefaultConfig now wants for deck0s/deck1s (one deck per
+// env slot; every slot gets the same pair in these tests).
+std::vector<int> TileDeck(const std::array<int, 60>& deck, int num_envs) {
+  std::vector<int> out;
+  out.reserve(deck.size() * num_envs);
+  for (int i = 0; i < num_envs; ++i) {
+    out.insert(out.end(), deck.begin(), deck.end());
+  }
+  return out;
+}
+
 // Column indices, mirrored from schema.py's *_COLUMNS tuples (same
 // source-of-truth duplication story as ptcg_schema.h/ptcg_encode.h -- no
 // shared codegen between Python and C++).
@@ -287,8 +299,8 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
   config["num_envs"_] = num_envs;
   config["batch_size"_] = num_envs;
   config["num_threads"_] = 1;
-  config["deck0"_] = std::vector<int>(kDeck.begin(), kDeck.end());
-  config["deck1"_] = std::vector<int>(kDeck.begin(), kDeck.end());
+  config["deck0s"_] = TileDeck(kDeck, num_envs);
+  config["deck1s"_] = TileDeck(kDeck, num_envs);
   ptcg::PtcgEnvSpec spec(config);
   ptcg::PtcgEnvPool envpool(spec);
 

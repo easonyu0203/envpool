@@ -34,14 +34,22 @@ namespace ptcg {
 
 class PtcgEnvFns {
  public:
-  // `deck0`/`deck1`: the fixed 60-card-id pair every episode in this
-  // EnvPool plays with, for the whole pool's lifetime -- set once via
-  // `make("Ptcg-v0", ..., deck0=[...], deck1=[...])`, never resampled
-  // per-episode. Changing decks means re-`make()`-ing the pool (cheap --
-  // measured ~9-27ms even at num_envs=1024), not a runtime setter.
+  // `deck0s`/`deck1s`: one fixed 60-card-id deck pair *per env slot*,
+  // flattened to length `num_envs * kDeckSize` each -- slot `env_id`'s pair
+  // is `deck0s[env_id*kDeckSize : (env_id+1)*kDeckSize]` (and likewise for
+  // deck1s), read once at that PtcgEnv's construction and fixed for the
+  // whole pool's lifetime (every episode in a given slot replays the same
+  // pair; different slots may hold entirely different pairs). Mirrors
+  // envpool/core/env.h's per-env `env_seed` config (`ResolveSeed`'s
+  // `env_seed.at(env_id)` slicing), generalized from one int per env to one
+  // 60-int deck per env. This is what lets one `make("Ptcg-v0", num_envs=N,
+  // ...)` call run N independently-paired matchups at once, rather than one
+  // shared pair broadcast to every env -- see the training pipeline's deck
+  // pairing scheme. Changing any pairing means re-`make()`-ing the pool
+  // (cheap -- measured ~9-27ms even at num_envs=1024), not a runtime setter.
   static decltype(auto) DefaultConfig() {
-    return MakeDict("deck0"_.Bind(std::vector<int>{}),
-                     "deck1"_.Bind(std::vector<int>{}));
+    return MakeDict("deck0s"_.Bind(std::vector<int>{}),
+                     "deck1s"_.Bind(std::vector<int>{}));
   }
 
   template <typename Config>
@@ -132,10 +140,11 @@ inline bool IsBypassedSelect(const State& state) {
  *    single-reward-per-step shape (see "Reward" in the skill) instead of
  *    that pattern's dual-player broadcast, which doesn't fit here.
  *  - Config-deck redesign: deck selection is no longer part of the
- *    trajectory. `deck0`/`deck1` are fixed EnvPool-lifetime config (see
- *    DefaultConfig), read once at construction; Reset() drives
- *    ApiBattleStart with them directly and its own response is already a
- *    real decide()-type observation. There is exactly one Step() shape now.
+ *    trajectory. `deck0s`/`deck1s` are fixed EnvPool-lifetime config, one
+ *    pair per env slot (see DefaultConfig), each env's own pair read once
+ *    at construction; Reset() drives ApiBattleStart with it directly and
+ *    its own response is already a real decide()-type observation. There
+ *    is exactly one Step() shape now.
  */
 class PtcgEnv : public Env<PtcgEnvSpec> {
  protected:
@@ -143,10 +152,12 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   int current_player_{0};
   int finish_reason_{0};
   ApiData* battle_{nullptr};
-  // Populated once, at construction, from config -- fixed for this
-  // PtcgEnv's whole lifetime (every episode in this slot plays the same
-  // pair). Never mutated by Step()/Reset() the way an earlier per-episode
-  // deck-select handshake used to.
+  // Populated once, at construction, from this env_id's own slice of the
+  // config's deck0s/deck1s -- fixed for this PtcgEnv's whole lifetime
+  // (every episode in this slot plays the same pair; a different slot in
+  // the same pool may hold an entirely different pair). Never mutated by
+  // Step()/Reset() the way an earlier per-episode deck-select handshake
+  // used to.
   std::array<int, kDeckSize> deck0_{};
   std::array<int, kDeckSize> deck1_{};
   // Real state.options-row indices already picked earlier in the current
@@ -171,18 +182,27 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     static std::once_flag init_flag;
     std::call_once(init_flag, InitializeAll);
 
-    // deck0/deck1 config -- see DefaultConfig's comment. A size mismatch
-    // is a config bug (wrong-length deck passed to make()), not a runtime
-    // condition to recover from -- fail loudly at construction rather than
-    // silently reading garbage/out-of-bounds later.
-    const auto& deck0_cfg = spec.config["deck0"_];
-    const auto& deck1_cfg = spec.config["deck1"_];
-    CHECK_EQ(deck0_cfg.size(), static_cast<std::size_t>(kDeckSize))
-        << "`deck0` config must contain exactly " << kDeckSize << " card ids";
-    CHECK_EQ(deck1_cfg.size(), static_cast<std::size_t>(kDeckSize))
-        << "`deck1` config must contain exactly " << kDeckSize << " card ids";
-    std::copy(deck0_cfg.begin(), deck0_cfg.end(), deck0_.begin());
-    std::copy(deck1_cfg.begin(), deck1_cfg.end(), deck1_.begin());
+    // deck0s/deck1s config -- see DefaultConfig's comment. Each is expected
+    // to be exactly `num_envs * kDeckSize` long (one deck per env slot,
+    // flattened); a size mismatch is a config bug (wrong-length list passed
+    // to make()), not a runtime condition to recover from -- fail loudly at
+    // construction rather than silently reading garbage/out-of-bounds
+    // later. This env_id's own slice is `[env_id*kDeckSize,
+    // (env_id+1)*kDeckSize)`, mirroring envpool/core/env.h's ResolveSeed
+    // per-env `env_seed.at(env_id)` pattern.
+    int num_envs = spec.config["num_envs"_];
+    const auto& deck0s_cfg = spec.config["deck0s"_];
+    const auto& deck1s_cfg = spec.config["deck1s"_];
+    CHECK_EQ(deck0s_cfg.size(), static_cast<std::size_t>(num_envs * kDeckSize))
+        << "`deck0s` config must contain exactly num_envs * " << kDeckSize
+        << " card ids (one " << kDeckSize << "-card deck per env slot)";
+    CHECK_EQ(deck1s_cfg.size(), static_cast<std::size_t>(num_envs * kDeckSize))
+        << "`deck1s` config must contain exactly num_envs * " << kDeckSize
+        << " card ids (one " << kDeckSize << "-card deck per env slot)";
+    auto deck0_begin = deck0s_cfg.begin() + env_id * kDeckSize;
+    auto deck1_begin = deck1s_cfg.begin() + env_id * kDeckSize;
+    std::copy(deck0_begin, deck0_begin + kDeckSize, deck0_.begin());
+    std::copy(deck1_begin, deck1_begin + kDeckSize, deck1_.begin());
   }
 
   ~PtcgEnv() override {

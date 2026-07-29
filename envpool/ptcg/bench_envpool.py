@@ -69,8 +69,9 @@ import envpool.ptcg.registration  # noqa: F401 -- side effect: registers "Ptcg-v
 from envpool.registration import make  # NOT `envpool.make` -- see "Build path" in the skill
 
 # Same real, deck-legal 60-card list used throughout this package's tests
-# (submissions/sample_submission/deck.csv). Both seats use it -- passed as
-# `deck0`/`deck1` config, fixed for the whole EnvPool's lifetime (see
+# (submissions/sample_submission/deck.csv). Both seats use it -- tiled to
+# `deck0s`/`deck1s` config (one 60-card deck per env slot, every slot the
+# same pair here), fixed for the whole EnvPool's lifetime (see
 # ptcg_envpool.h's DefaultConfig).
 _DECK = [
     1158, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 1145,
@@ -138,7 +139,7 @@ def _gymnasium_stepper(num_envs: int, batch_size: int, num_threads: int):
     """
     env = make(
         "Ptcg-v0", env_type="gymnasium", num_envs=num_envs, batch_size=batch_size,
-        num_threads=num_threads, deck0=_DECK, deck1=_DECK,
+        num_threads=num_threads, deck0s=_DECK * num_envs, deck1s=_DECK * num_envs,
     )
 
     env.async_reset()
@@ -178,7 +179,7 @@ def _raw_api_stepper(num_envs: int, batch_size: int, num_threads: int):
     )
     conf.update(
         num_envs=num_envs, batch_size=num_envs, num_threads=num_threads,
-        deck0=_DECK, deck1=_DECK,
+        deck0s=_DECK * num_envs, deck1s=_DECK * num_envs,
     )
     env_spec = _PtcgEnvSpec(tuple(conf.values()))
     env = _PtcgEnvPool(env_spec)

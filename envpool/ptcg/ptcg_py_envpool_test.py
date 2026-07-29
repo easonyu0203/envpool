@@ -24,16 +24,23 @@ output on decide() steps (ptcg_encode.h, tested for structural
 self-consistency in ptcg_encode_test.cc -- this file doesn't re-derive that,
 just checks the obs stops being all-zero); Phase 4's real action-space
 validation and the resulting terminal reward. The config-deck redesign moved
-deck selection out of the trajectory entirely: `deck0`/`deck1` are fixed
-EnvPool-lifetime config (see ptcg_envpool.h's DefaultConfig) -- Reset()'s own
-response is already a genuine decide()-type observation, and the action
-space is a single scalar index per env, not a 60-wide vector.
+deck selection out of the trajectory entirely: `deck0s`/`deck1s` (one deck
+pair per env slot) are fixed EnvPool-lifetime config (see ptcg_envpool.h's
+DefaultConfig) -- Reset()'s own response is already a genuine decide()-type
+observation, and the action space is a single scalar index per env, not a
+60-wide vector.
 
 Real games are nondeterministic in length and first-player assignment (no
 seed parameter on ApiBattleStart -- see "Resets are nondeterministic" in the
 skill), so unlike Phase 1's fixed 6-step fake episode, these tests assert
 structural invariants across full real episodes rather than an exact
 sequence table.
+
+`deck0s`/`deck1s` (see ptcg_envpool.h's DefaultConfig) are one 60-card deck
+per env slot, flattened -- length num_envs*60 each. Every test here gives
+every slot the same pair (`_DECK * num_envs`), since none of them are
+testing per-slot pairing itself (that's the training pipeline's concern, not
+this env's) -- just that the config plumbs through to the right env_id.
 """
 
 import numpy as np
@@ -108,8 +115,9 @@ def _default_conf(**overrides: object) -> dict:
 
 class PtcgEnvPoolTest(absltest.TestCase):
     def test_config(self) -> None:
-        # PtcgEnvFns::DefaultConfig() adds deck0/deck1 (the config-deck
-        # redesign, see ptcg_envpool.h) on top of envpool's common config.
+        # PtcgEnvFns::DefaultConfig() adds deck0s/deck1s (one deck per env
+        # slot, the config-deck redesign, see ptcg_envpool.h) on top of
+        # envpool's common config.
         ref_config_keys = [
             "num_envs",
             "batch_size",
@@ -121,8 +129,8 @@ class PtcgEnvPoolTest(absltest.TestCase):
             "env_seed",
             "gym_reset_return_info",
             "max_episode_steps",
-            "deck0",
-            "deck1",
+            "deck0s",
+            "deck1s",
         ]
         self.assertEqual(
             sorted(_PtcgEnvSpec._config_keys), sorted(ref_config_keys)
@@ -198,7 +206,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         num_envs = 3
         conf = _default_conf(
             num_envs=num_envs, batch_size=num_envs, num_threads=1,
-            deck0=_DECK, deck1=_DECK,
+            deck0s=_DECK * num_envs, deck1s=_DECK * num_envs,
         )
         env_spec = _PtcgEnvSpec(tuple(conf.values()))
         env = _PtcgEnvPool(env_spec)
@@ -315,7 +323,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         num_envs = 2
         env = make(
             "Ptcg-v0", env_type="gymnasium", num_envs=num_envs,
-            deck0=_DECK, deck1=_DECK,
+            deck0s=_DECK * num_envs, deck1s=_DECK * num_envs,
         )
         obs, info = env.reset()
         self.assertEqual(obs["cards"].shape, (num_envs, 120, 5))
@@ -367,7 +375,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         # structurally unreachable (an invalid configured deck now
         # CHECK-fails Reset(), a construction/config bug).
         conf = _default_conf(
-            num_envs=1, batch_size=1, num_threads=1, deck0=_DECK, deck1=_DECK,
+            num_envs=1, batch_size=1, num_threads=1, deck0s=_DECK, deck1s=_DECK,
         )
         env_spec = _PtcgEnvSpec(tuple(conf.values()))
         env = _PtcgEnvPool(env_spec)

@@ -65,9 +65,10 @@ constexpr int kOptionRows = kMaxOptions + 1;
 // literal, cross-checked against ApiType.h's SelectOptionType by hand.
 constexpr int kStopOptionType = 17;
 
-// A single deck's card count -- both configured decks (`deck0`/`deck1`
-// config keys, see ptcg_envpool.h) are exactly this many card ids, and
-// ApiBattleStart's `cards` argument is two of these concatenated.
+// A single deck's card count -- each env slot's own resolved deck pair
+// (sliced from the `deck0s`/`deck1s` config keys, see ptcg_envpool.h) is
+// exactly this many card ids per side, and ApiBattleStart's `cards`
+// argument is two of these concatenated.
 constexpr int kDeckSize = 60;
 
 }  // namespace ptcg
