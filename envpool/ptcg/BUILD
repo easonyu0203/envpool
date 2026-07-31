@@ -109,6 +109,21 @@ cc_test(
     ],
 )
 
+# Dense-reward/round-cap-timeout redesign tests (see ptcg_reward_test.cc's
+# own doc comment).
+cc_test(
+    name = "ptcg_reward_test",
+    size = "small",
+    srcs = ["ptcg_reward_test.cc"],
+    copts = ["-std=c++20"],
+    linkopts = _DL_LINKOPTS,
+    deps = [
+        ":ptcg_envpool_h",
+        "//envpool/core:logging",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 # Phase 5 (envpool-ptcg-integration skill): fixtures generated once by
 # tests/encoding/generate_ptcg_encode_fixtures.py in the main repo (not part
 # of this build) and checked in -- see ptcg_cross_validation_test.cc.

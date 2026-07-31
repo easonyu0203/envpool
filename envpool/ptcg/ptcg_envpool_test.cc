@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <vector>
 
 using PtcgAction = typename ptcg::PtcgEnv::Action;
@@ -74,6 +75,13 @@ std::vector<int> TileDeck(const std::array<int, 60>& deck, int num_envs) {
 struct EnvTrack {
   bool done = false;
   bool completed_once = false;
+  // True exactly when the *next* recv for this env is a fresh Reset()
+  // response -- true initially (every env's very first recv is exactly
+  // that) and re-armed whenever a round completes an episode (the next
+  // Send() for that env_id triggers AsyncEnvPool's auto-reset). Distinct
+  // from `done`, which describes the round just processed, not the next
+  // one.
+  bool just_reset = true;
   std::vector<int> last_options;  // valid only when !done
 };
 
@@ -130,14 +138,19 @@ int PickLegalAction(const std::vector<int>& options_flat) {
 // ptcg_envpool.h's DefaultConfig -- no more deck-select trajectory step);
 // decide() steps keep current_player in {0,1}; obs tensors are all-zero only
 // on the terminal step and non-trivial (real encoder output, Phase 3)
-// otherwise; reward is 0.0 except on the step done becomes true, where it's
-// the real apiResult()-derived terminal reward (Phase 4) -- every action
-// sent here is always a real option row read off the just-observed
-// obs:options and picked by PickLegalAction() (see its comment), so this
-// test's games always end via genuine win/loss/draw, never the
-// illegal-action penalty path (see ptcg_envpool_illegal_test.cc for that);
-// every env eventually reaches done. Same "diff structurally, not bit-exact"
-// adjustment Phase 0 already made for the same underlying reason.
+// otherwise; reward is always finite, and reward_player is -1 only on the
+// very first recv (Reset()'s own response, before any action was ever
+// submitted) and 0/1 on every recv after that (see ptcg_reward_test.cc for
+// exact dense/lump-sum value checks -- this test stays structural) --
+// every action sent here is always a real option row read off the
+// just-observed obs:options and picked by PickLegalAction() (see its
+// comment), so this test's games always end via genuine win/loss/draw,
+// never the illegal-action penalty path (see ptcg_envpool_illegal_test.cc
+// for that); max_rounds is set generously below so the new envpool-side
+// round-cap timeout (see ptcg_reward_test.cc) never fires here either --
+// every env eventually reaches done via a real engine finish. Same
+// "diff structurally, not bit-exact" adjustment Phase 0 already made for
+// the same underlying reason.
 //
 // num_envs == batch_size == 3 (sync mode): real games run dozens+ of
 // decide() calls each, which alone cycles every StateBuffer ring-buffer slot
@@ -158,6 +171,10 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
   config["num_threads"_] = 1;
   config["deck0s"_] = TileDeck(kDeck, num_envs);
   config["deck1s"_] = TileDeck(kDeck, num_envs);
+  // Generous on purpose: this test wants every episode to reach a genuine
+  // engine finish, never the round-cap timeout (see ptcg_reward_test.cc for
+  // that scenario) -- matches the test's own kMaxRounds safety bound below.
+  config["max_rounds"_] = 20000;
   ptcg::PtcgEnvSpec spec(config);
   ptcg::PtcgEnvPool envpool(spec);
 
@@ -176,6 +193,7 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
       EnvTrack& t = track[env_id];
 
       int current_player = static_cast<int>(state["info:current_player"_][i]);
+      int reward_player = static_cast<int>(state["info:reward_player"_][i]);
       bool done = static_cast<bool>(state["done"_][i]);
       float reward = static_cast<float>(state["reward"_][i]);
       int finish_reason = static_cast<int>(state["info:finish_reason"_][i]);
@@ -191,27 +209,42 @@ TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
         ExpectNotAllZero(state["obs:cards"_][i]);
         t.last_options = CopyOptions(TArray<int>(state["obs:options"_][i]));
       }
+      // Dense reward (see ptcg_reward_test.cc for exact value checks): no
+      // longer pinned to {1,0,-1} / "0 iff not done" -- just finite, on
+      // every row.
+      EXPECT_TRUE(std::isfinite(reward)) << "env_id=" << env_id << " reward=" << reward;
       if (done) {
-        EXPECT_TRUE(reward == 1.0F || reward == 0.0F || reward == -1.0F)
-            << "env_id=" << env_id << " reward=" << reward;
         // Every game in this test ends via a real engine win/loss/draw,
         // never the illegal-action penalty path (see the doc comment
-        // above) -- so finish_reason should always be a genuine non-None
-        // FinishReason (State.h: Prize0=1, Deck0=2, NoActivePokemon=3,
-        // Effect=4, Other=9), never left at its 0 default.
+        // above) and never the round-cap timeout (max_rounds is set
+        // generously above) -- so finish_reason should always be a
+        // genuine non-None FinishReason (State.h: Prize0=1, Deck0=2,
+        // NoActivePokemon=3, Effect=4, Other=9), never left at its 0
+        // default or the timeout sentinel.
         EXPECT_TRUE(finish_reason == 1 || finish_reason == 2 ||
                     finish_reason == 3 || finish_reason == 4 ||
                     finish_reason == 9)
             << "env_id=" << env_id << " finish_reason=" << finish_reason;
       } else {
-        EXPECT_FLOAT_EQ(reward, 0.0F) << "env_id=" << env_id;
         EXPECT_EQ(finish_reason, 0) << "env_id=" << env_id;
       }
 
       EXPECT_GE(current_player, 0) << "env_id=" << env_id;
       EXPECT_LE(current_player, 1) << "env_id=" << env_id;
+      // reward_player is -1 exactly on a fresh Reset() response (no prior
+      // actor exists yet) and a real seat on every other row, including
+      // done==true ones (see "Reward" in the skill: current_player and
+      // reward_player coincide on a terminal row, but reward_player is the
+      // field that's actually meaningful to read for attribution).
+      if (t.just_reset) {
+        EXPECT_EQ(reward_player, -1) << "env_id=" << env_id;
+      } else {
+        EXPECT_GE(reward_player, 0) << "env_id=" << env_id;
+        EXPECT_LE(reward_player, 1) << "env_id=" << env_id;
+      }
 
       t.done = done;
+      t.just_reset = done;  // this round's action (if any) triggers auto-reset next
       if (done) {
         t.completed_once = true;
       }

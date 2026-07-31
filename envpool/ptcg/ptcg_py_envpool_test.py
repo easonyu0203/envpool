@@ -13,7 +13,7 @@
 # limitations under the License.
 """Unit test for the Phases 2-4 ptcg envpool (real ptcg_engine calls, the
 C++-ported observation encoder, and full action-space validation/reward),
-plus the later config-deck redesign.
+plus the later config-deck and dense-reward/round-cap-timeout redesigns.
 
 See the envpool-ptcg-integration skill's "Phased implementation checklist":
 Phase 2's real Reset()/Step() flow into ApiBattleStart, real ApiSelect
@@ -23,12 +23,17 @@ Python actually sees is a genuine decision; Phase 3's real per-field encoder
 output on decide() steps (ptcg_encode.h, tested for structural
 self-consistency in ptcg_encode_test.cc -- this file doesn't re-derive that,
 just checks the obs stops being all-zero); Phase 4's real action-space
-validation and the resulting terminal reward. The config-deck redesign moved
-deck selection out of the trajectory entirely: `deck0s`/`deck1s` (one deck
-pair per env slot) are fixed EnvPool-lifetime config (see ptcg_envpool.h's
-DefaultConfig) -- Reset()'s own response is already a genuine decide()-type
-observation, and the action space is a single scalar index per env, not a
-60-wide vector.
+validation and reward. The config-deck redesign moved deck selection out of
+the trajectory entirely: `deck0s`/`deck1s` (one deck pair per env slot) are
+fixed EnvPool-lifetime config (see ptcg_envpool.h's DefaultConfig) --
+Reset()'s own response is already a genuine decide()-type observation, and
+the action space is a single scalar index per env, not a 60-wide vector.
+The dense-reward/round-cap-timeout redesign made reward per-prize instead of
+terminal-only (see "Reward" in the skill) and added a per-episode
+`max_rounds` config field, both exercised structurally here
+(`test_config`/`test_spec`'s `info:reward_player`/`max_rounds` checks,
+`test_raw_envpool_real_engine_end_to_end`'s finite-reward/`reward_player`
+invariants) -- exact dense values are ptcg_reward_test.cc's job instead.
 
 Real games are nondeterministic in length and first-player assignment (no
 seed parameter on ApiBattleStart -- see "Resets are nondeterministic" in the
@@ -131,6 +136,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
             "max_episode_steps",
             "deck0s",
             "deck1s",
+            "max_rounds",
         ]
         self.assertEqual(
             sorted(_PtcgEnvSpec._config_keys), sorted(ref_config_keys)
@@ -174,6 +180,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
         self.assertEqual(tuple(state_spec["obs:select"][1]), (18,))
         self.assertEqual(tuple(state_spec["obs:options"][1]), (64, 20))
         self.assertEqual(tuple(state_spec["info:current_player"][1]), ())
+        self.assertEqual(tuple(state_spec["info:reward_player"][1]), ())
         self.assertEqual(tuple(state_spec["info:finish_reason"][1]), ())
         # Scalar now -- decks are config, not part of the action anymore
         # (see ptcg_envpool.h's ActionSpec).
@@ -207,6 +214,11 @@ class PtcgEnvPoolTest(absltest.TestCase):
         conf = _default_conf(
             num_envs=num_envs, batch_size=num_envs, num_threads=1,
             deck0s=_DECK * num_envs, deck1s=_DECK * num_envs,
+            # Generous on purpose: this test wants every episode to reach a
+            # genuine engine finish, never the round-cap timeout (a separate
+            # scenario, exercised in envpool/envpool/ptcg/ptcg_reward_test.cc
+            # since it needs the C++-level info:finish_reason granularity).
+            max_rounds=_MAX_ROUNDS,
         )
         env_spec = _PtcgEnvSpec(tuple(conf.values()))
         env = _PtcgEnvPool(env_spec)
@@ -240,6 +252,12 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 "done": False,
                 "completed_once": False,
                 "last_options": None,
+                # True exactly when the *next* recv for this env is a
+                # fresh Reset() response -- true initially (every env's
+                # very first recv is exactly that) and re-armed whenever a
+                # round completes an episode (see reward_player's check
+                # below).
+                "just_reset": True,
             } for _ in range(num_envs)
         ]
 
@@ -249,6 +267,7 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 env_id = int(env_ids[slot])
                 t = track[env_id]
                 current_player = int(state["info:current_player"][slot])
+                reward_player = int(state["info:reward_player"][slot])
                 done = bool(state["done"][slot])
                 reward = float(state["reward"][slot])
                 finish_reason = int(state["info:finish_reason"][slot])
@@ -258,24 +277,40 @@ class PtcgEnvPoolTest(absltest.TestCase):
                 else:
                     assert_not_all_zero_cards(state, slot)
                     t["last_options"] = np.array(state["obs:options"][slot])
+                # Dense reward (envpool-ptcg-integration skill's "Reward"):
+                # no longer pinned to {1,0,-1} / "0 iff not done" -- see
+                # ptcg_reward_test.cc for exact value checks, this test
+                # stays structural. Just finite, on every row.
+                self.assertTrue(np.isfinite(reward), f"env_id={env_id} reward={reward}")
                 if done:
-                    self.assertIn(reward, (1.0, 0.0, -1.0), f"env_id={env_id}")
                     # Every game in this test ends via a real engine
                     # win/loss/draw, never the illegal-action penalty path
-                    # (see this test's docstring) -- so finish_reason should
-                    # always be a genuine non-None FinishReason (State.h:
-                    # Prize0=1, Deck0=2, NoActivePokemon=3, Effect=4,
-                    # Other=9), never left at its 0 default.
+                    # (see this test's docstring) and never the round-cap
+                    # timeout (max_rounds is set generously above) -- so
+                    # finish_reason should always be a genuine non-None
+                    # FinishReason (State.h: Prize0=1, Deck0=2,
+                    # NoActivePokemon=3, Effect=4, Other=9), never left at
+                    # its 0 default or the timeout sentinel.
                     self.assertIn(
                         finish_reason, (1, 2, 3, 4, 9), f"env_id={env_id}"
                     )
                 else:
-                    self.assertEqual(reward, 0.0, f"env_id={env_id}")
                     self.assertEqual(finish_reason, 0, f"env_id={env_id}")
 
                 self.assertIn(current_player, (0, 1), f"env_id={env_id}")
+                # reward_player is -1 exactly on a fresh Reset() response
+                # (no prior actor exists yet) and a real seat on every
+                # other row, including done==True ones (current_player and
+                # reward_player coincide on a terminal row, but
+                # reward_player is the field that's actually meaningful to
+                # read for attribution -- see "Reward" in the skill).
+                if t["just_reset"]:
+                    self.assertEqual(reward_player, -1, f"env_id={env_id}")
+                else:
+                    self.assertIn(reward_player, (0, 1), f"env_id={env_id}")
 
                 t["done"] = done
+                t["just_reset"] = done  # this round's action (if any) triggers auto-reset next
                 if done:
                     t["completed_once"] = True
 
@@ -324,6 +359,8 @@ class PtcgEnvPoolTest(absltest.TestCase):
         env = make(
             "Ptcg-v0", env_type="gymnasium", num_envs=num_envs,
             deck0s=_DECK * num_envs, deck1s=_DECK * num_envs,
+            # Generous on purpose -- see test_raw_envpool_real_engine_end_to_end.
+            max_rounds=_MAX_ROUNDS,
         )
         obs, info = env.reset()
         self.assertEqual(obs["cards"].shape, (num_envs, 120, 5))
@@ -358,11 +395,12 @@ class PtcgEnvPoolTest(absltest.TestCase):
             )
             self.assertEqual(obs["cards"].shape, (num_envs, 120, 5))
             for slot in range(num_envs):
+                # Dense reward -- see test_raw_envpool_real_engine_end_to_end
+                # and ptcg_reward_test.cc for the exact-value checks.
+                self.assertTrue(np.isfinite(float(reward[slot])))
                 if terminated[slot]:
-                    self.assertIn(float(reward[slot]), (1.0, 0.0, -1.0))
                     self.assertIn(int(info["finish_reason"][slot]), (1, 2, 3, 4, 9))
                 else:
-                    self.assertEqual(float(reward[slot]), 0.0)
                     self.assertEqual(int(info["finish_reason"][slot]), 0)
 
         self.assertTrue(terminated.any())
@@ -410,6 +448,11 @@ class PtcgEnvPoolTest(absltest.TestCase):
             int(state["info:current_player"][0]), actor_before,
             "no SyncFromEngine happens on the illegal path -- "
             "current_player_ stays exactly what it was announced as",
+        )
+        self.assertEqual(
+            int(state["info:reward_player"][0]), actor_before,
+            "the offender is who submitted this action, so they're who "
+            "the -1.0 penalty belongs to",
         )
         self.assertEqual(
             int(state["info:finish_reason"][0]), 0,

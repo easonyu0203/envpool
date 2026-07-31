@@ -32,6 +32,13 @@
 
 namespace ptcg {
 
+// Non-engine finish_reason sentinel for this env's own round-cap timeout
+// close-out (AutoResolveForcedSubPicksThenRespond) -- never produced by the
+// engine itself (State.h's FinishReason enum is 0-9). Mirrors
+// training/finish_reason.py's FINISH_REASON_TIMEOUT, which reserves this
+// exact value outside the engine's own range for exactly this.
+constexpr int kFinishReasonTimeout = -1;
+
 class PtcgEnvFns {
  public:
   // `deck0s`/`deck1s`: one fixed 60-card-id deck pair *per env slot*,
@@ -47,9 +54,16 @@ class PtcgEnvFns {
   // shared pair broadcast to every env -- see the training pipeline's deck
   // pairing scheme. Changing any pairing means re-`make()`-ing the pool
   // (cheap -- measured ~9-27ms even at num_envs=1024), not a runtime setter.
+  //
+  // `max_rounds`: per-episode cap on genuine (Python-visible) decisions --
+  // see PtcgEnv::round_count_/max_rounds_ and
+  // AutoResolveForcedSubPicksThenRespond. Default matches
+  // training/config.py's RolloutConfig.max_rounds fallback; real training
+  // runs always pass their own value explicitly.
   static decltype(auto) DefaultConfig() {
     return MakeDict("deck0s"_.Bind(std::vector<int>{}),
-                     "deck1s"_.Bind(std::vector<int>{}));
+                     "deck1s"_.Bind(std::vector<int>{}),
+                     "max_rounds"_.Bind(128));
   }
 
   template <typename Config>
@@ -65,13 +79,28 @@ class PtcgEnvFns {
         // Routing metadata, not part of the 6 encoded tensors above -- see
         // "Observation space" in the envpool-ptcg-integration skill.
         "info:current_player"_.Bind(Spec<int>({}, {0, 1})),
+        // Who this step's `reward` belongs to: the player that SUBMITTED
+        // the action being resolved, snapshotted before any mutation
+        // (Step()'s `acting_player`, threaded through the whole resolve
+        // chain). Distinct from info:current_player, which names whoever
+        // decides the *returned* observation (who's next, not who just
+        // acted) -- the two coincide only on a terminal row, where there's
+        // no "next" to advance to. -1 only on the very first observation
+        // of a fresh episode (Reset()'s own response, before any action
+        // has ever been submitted); always 0/1 on every other row. See
+        // "Reward" in the envpool-ptcg-integration skill.
+        "info:reward_player"_.Bind(Spec<int>({}, {-1, 1})),
         // Raw State.h FinishReason cast to int: None=0, Prize0=1, Deck0=2,
         // NoActivePokemon=3, Effect=4, Other=9. Only meaningful on a row
         // where `terminated` came from the engine's own state.isFinish()
         // (see ResolveBypassedSelectsThenRespond) -- stays 0 on every other
         // row, including the envpool-side illegal-action instant-loss
         // terminations, which never run the engine's real finishCheck().
-        "info:finish_reason"_.Bind(Spec<int>({}, {0, 9})));
+        // kFinishReasonTimeout (-1) is the one non-engine value: this
+        // env's own round-cap close-out
+        // (AutoResolveForcedSubPicksThenRespond), never produced by the
+        // engine itself.
+        "info:finish_reason"_.Bind(Spec<int>({}, {kFinishReasonTimeout, 9})));
   }
 
   template <typename Config>
@@ -111,7 +140,7 @@ inline bool IsBypassedSelect(const State& state) {
  * Phases 2-4 (envpool-ptcg-integration skill) are all wired in, plus a
  * single-index-action redesign (see CLAUDE.md's "Current focus" /
  * schema.py's STOP_SLOT/N_OPTION_SLOTS comment), plus a later config-deck
- * redesign:
+ * redesign, plus a dense-reward/round-cap-timeout redesign:
  *  - Phase 2: real Reset()/Step() flow into ApiBattleStart, deviceRand=false
  *    throughput fix, real ApiSelect stepping, IsDone() via
  *    state.isFinish().
@@ -145,6 +174,25 @@ inline bool IsBypassedSelect(const State& state) {
  *    at construction; Reset() drives ApiBattleStart with it directly and
  *    its own response is already a real decide()-type observation. There
  *    is exactly one Step() shape now.
+ *  - Dense-reward/round-cap-timeout redesign: reward is no longer
+ *    terminal-only. Every Step()/Reset() response carries a dense
+ *    per-prize component (ConsumeDensePrizeReward -- diffs each player's
+ *    remaining prize count against the last call, attributed to
+ *    `acting_player`: who submitted the action being resolved, threaded
+ *    through the whole resolve chain and distinct from
+ *    current_player_/info:current_player, which names whoever decides the
+ *    *returned* obs), plus, on a genuine engine-driven finish, a lump sum
+ *    crediting the winner their own still-unclaimed prizes
+ *    (NoActivePokemon/Deck0/Effect/Prize0 all reduce to this one rule).
+ *    Separately, max_rounds_/round_count_ enforce a per-episode cap on
+ *    genuine decisions inside AutoResolveForcedSubPicksThenRespond --
+ *    training's own collection loop no longer truncates itself, trusting
+ *    every episode to close (normally or via this env-side timeout) within
+ *    max_rounds. `timeout_penalty` itself is intentionally NOT env config:
+ *    applying it in Python (training/buffer.py) instead of folding it into
+ *    one flat scalar here keeps a dense delta that happens to land on the
+ *    exact round-cap step correctly mirrored rather than accidentally
+ *    unmirrored. See "Reward" in the envpool-ptcg-integration skill.
  */
 class PtcgEnv : public Env<PtcgEnvSpec> {
  protected:
@@ -160,12 +208,29 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   // used to.
   std::array<int, kDeckSize> deck0_{};
   std::array<int, kDeckSize> deck1_{};
+  // Per-episode cap on genuine (Python-visible) decisions -- config, fixed
+  // for this PtcgEnv's whole lifetime, like deck0_/deck1_ above. See
+  // round_count_ below and AutoResolveForcedSubPicksThenRespond.
+  int max_rounds_{0};
   // Real state.options-row indices already picked earlier in the current
   // decide()-type decision -- reset to empty every time a fresh, non-
   // bypassed decide() prompt begins (see ResolveBypassedSelectsThenRespond),
   // accumulated across however many Step() calls that decision takes, and
   // submitted to the real ApiSelect exactly once, at FinalizeSelection().
   std::vector<int> chosen_;
+  // How many genuine decisions the CURRENT episode has already presented
+  // -- reset at Reset(), gates the round-cap timeout below. Counts every
+  // Step() round-trip, including sub-picks of a multi-pick decision,
+  // matching what training/rollout.py's own round counter already counts.
+  int round_count_{0};
+  // Each player's ps.prize.size() ("remaining prizes") as of the last
+  // WriteState-producing resolution -- ConsumeDensePrizeReward's diff
+  // baseline, refreshed on every call. The {PRIZE_SIZE, PRIZE_SIZE}
+  // member-initializer (also reset at Reset()) is only ever a placeholder,
+  // not a claim that prizes are already dealt at that point -- they
+  // aren't (see ConsumeDensePrizeReward's own doc comment); it's
+  // overwritten with the real live value on the very first call regardless.
+  std::array<int, 2> prev_prize_remaining_{PRIZE_SIZE, PRIZE_SIZE};
 
  public:
   PtcgEnv(const Spec& spec, int env_id) : Env<PtcgEnvSpec>(spec, env_id) {
@@ -203,6 +268,8 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     auto deck1_begin = deck1s_cfg.begin() + env_id * kDeckSize;
     std::copy(deck0_begin, deck0_begin + kDeckSize, deck0_.begin());
     std::copy(deck1_begin, deck1_begin + kDeckSize, deck1_.begin());
+
+    max_rounds_ = spec.config["max_rounds"_];
   }
 
   ~PtcgEnv() override {
@@ -227,6 +294,8 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     current_player_ = 0;
     finish_reason_ = 0;
     chosen_.clear();
+    round_count_ = 0;
+    prev_prize_remaining_ = {PRIZE_SIZE, PRIZE_SIZE};
 
     std::array<int, 2 * kDeckSize> cards{};
     std::copy(deck0_.begin(), deck0_.end(), cards.begin());
@@ -249,30 +318,39 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     // battle.
     battle_->game.config.deviceRand = false;
 
-    ResolveBypassedSelectsThenRespond();
+    // No real prior actor for the very first decision of a fresh episode
+    // -- reward is trivially 0 there regardless (nothing has happened
+    // yet), see ConsumeDensePrizeReward's actor<0 no-op guard.
+    ResolveBypassedSelectsThenRespond(-1);
   }
 
   void Step(const Action& action) override {
+    // Snapshot before any mutation: current_player_ still names whoever
+    // this action was asked of (see SyncFromEngine, called only after this
+    // point) -- the reward this call produces always belongs to them,
+    // distinct from info:current_player on the *returned* row (which names
+    // whoever decides next). See "Reward" in the skill.
+    const int acting_player = current_player_;
     int a = action["action"_];
     std::vector<int> legal = LegalActions();
     if (std::find(legal.begin(), legal.end(), a) == legal.end()) {
-      // Illegal action -> instant loss for the offender (state.selectPlayer,
-      // current_player_). ApiSelect is never even called on this
-      // path (validated against LegalActions() first), so battle_->state
-      // is completely unchanged -- no SyncFromEngine() call, and WriteState
-      // correctly Zero()s the obs rather than re-encoding a decision that
-      // never advanced.
+      // Illegal action -> instant loss for the offender (acting_player).
+      // ApiSelect is never even called on this path (validated against
+      // LegalActions() first), so battle_->state is completely unchanged
+      // -- no SyncFromEngine() call, no dense component (nothing advanced
+      // to diff), and WriteState correctly Zero()s the obs rather than
+      // re-encoding a decision that never advanced.
       done_ = true;
       finish_reason_ = 0;
-      WriteState(-1.0F);
+      WriteState(-1.0F, acting_player);
       return;
     }
     if (a == kStopSlot) {
-      FinalizeSelection();
+      FinalizeSelection(acting_player);
       return;
     }
     chosen_.push_back(a);
-    AutoResolveForcedSubPicksThenRespond();
+    AutoResolveForcedSubPicksThenRespond(acting_player);
   }
 
  private:
@@ -305,15 +383,16 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   // Runs from the current chosen_ state (either just-appended-by-Python in
   // Step, or freshly reset for a new decide()-type prompt in
   // ResolveBypassedSelectsThenRespond): auto-advances through any round
-  // where LegalActions() collapses to exactly one option -- generalizes
-  // the forced-full-select/prize-select whole-decision bypass
-  // (IsBypassedSelect) to intra-decision sub-picks (e.g. "only one valid
-  // card remains" or "selectMax was just reached, only STOP is legal"), so
-  // Python only ever sees a genuine multi-way decide() step, never a
-  // deterministic one. Finalizes (real ApiSelect + recurse into
+  // where LegalActions() collapses to exactly one option (e.g. "only one
+  // valid card remains" or "selectMax was just reached, only STOP is
+  // legal"), so Python only ever sees a genuine multi-way decide() step,
+  // never a deterministic one. Finalizes (real ApiSelect + recurse into
   // ResolveBypassedSelectsThenRespond) the instant that happens; otherwise
-  // presents the resulting decision with WriteState(0.0F).
-  void AutoResolveForcedSubPicksThenRespond() {
+  // presents the resulting decision -- unless this episode has already
+  // used up its max_rounds_ budget of genuine decisions, in which case it
+  // force-closes with a timeout instead of presenting another one (see
+  // "Dense-reward/round-cap-timeout redesign" above).
+  void AutoResolveForcedSubPicksThenRespond(int acting_player) {
     while (true) {
       std::vector<int> legal = LegalActions();
       CHECK(!legal.empty())
@@ -323,13 +402,33 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
         break;
       }
       if (legal[0] == kStopSlot) {
-        FinalizeSelection();
+        FinalizeSelection(acting_player);
         return;
       }
       chosen_.push_back(legal[0]);
     }
+    // Always credit whatever the just-finalized action changed, whether or
+    // not this row turns out to be a timeout close-out below -- a dense
+    // delta that happens to land on the exact round-cap boundary must
+    // still be credited, not dropped.
+    float dense = ConsumeDensePrizeReward(acting_player);
+    if (round_count_ >= max_rounds_) {
+      // Round-cap timeout: this episode already used up its budget of
+      // genuine decisions. Force-close instead of presenting another one.
+      // Reward is *only* the dense component above -- training applies
+      // timeout_penalty itself (buffer.py), not this env (see the class
+      // doc comment's "Dense-reward/round-cap-timeout redesign"). No
+      // SyncFromEngine(): current_player_ keeps its last real value, not
+      // meaningful on a terminal row regardless (mirrors the
+      // illegal-action path in Step()).
+      done_ = true;
+      finish_reason_ = kFinishReasonTimeout;
+      WriteState(dense, acting_player);
+      return;
+    }
+    round_count_++;
     SyncFromEngine();
-    WriteState(0.0F);
+    WriteState(dense, acting_player);
   }
 
   // Submits chosen_ as the final answer to this decide()-type selection.
@@ -341,27 +440,27 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
   // ResolveBypassedSelectsThenRespond's own bypass-selection assertion:
   // a failure here means LegalActions() has drifted from the engine's real
   // state.checkPlayerSelect() rule, a bug to fix, not a real game outcome.
-  void FinalizeSelection() {
+  void FinalizeSelection(int acting_player) {
     int error =
         ApiSelect(battle_, chosen_.data(), static_cast<int>(chosen_.size()));
     CHECK_EQ(error, 0)
         << "PtcgEnv's own tracked selection was rejected by ApiSelect -- "
            "LegalActions() has drifted from the engine's real legality rule";
-    ResolveBypassedSelectsThenRespond();
+    ResolveBypassedSelectsThenRespond(acting_player);
   }
 
   // Runs ApiSelect's own bypass loop forward through any forced-full-select/
   // prize-select decision points (Phase 2.5, "Trajectory & prompt routing"),
   // then either hands off to a fresh decide()-type prompt's own
-  // auto-resolve loop, or -- if the game ended instead -- computes the
-  // terminal-only reward ("Reward" in the skill) and writes the response.
+  // auto-resolve loop, or -- if the game ended instead -- computes this
+  // step's reward ("Reward" in the skill) and writes the response.
   // Shared by Reset()'s post-ApiBattleStart path, Step's post-illegal-check
   // path (via AutoResolveForcedSubPicksThenRespond / FinalizeSelection), and
   // FinalizeSelection itself -- deliberately, since a just-started battle's
   // first decision point could in principle itself be bypassed
   // (astronomically unlikely, but free to handle correctly by reusing this
   // rather than special-casing it away).
-  void ResolveBypassedSelectsThenRespond() {
+  void ResolveBypassedSelectsThenRespond(int acting_player) {
     while (!battle_->state.isFinish() && IsBypassedSelect(battle_->state)) {
       std::vector<int> bypass = ComputeBypassSelection();
       int error = ApiSelect(battle_, bypass.data(),
@@ -378,25 +477,34 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
       // path start-to-finish) or present a genuine choice.
       finish_reason_ = 0;
       chosen_.clear();
-      AutoResolveForcedSubPicksThenRespond();
+      AutoResolveForcedSubPicksThenRespond(acting_player);
       return;
     }
-    // "Reward" in the skill: state.apiResult() (-1/0/1/2), not a raw
-    // GameResult cast. For *that step's player* (state.selectPlayer):
-    // +1.0 if apiResult()==selectPlayer, -1.0 if it's the other player's
-    // index, 0.0 on draw.
-    float reward = 0.0F;
+    // Reward ("Reward" in the skill): dense component (prizes taken
+    // resolving this action, for either player -- see
+    // ConsumeDensePrizeReward) plus, only on a real apiResult() winner (not
+    // a draw), a lump sum crediting the winner their own still-unclaimed
+    // prizes. NoActivePokemon/Deck0/Effect/Prize0 all reduce to this one
+    // rule: on a normal Prize0 win the winner already has 0 prizes left,
+    // so the lump sum is a no-op and the dense stream already accounts for
+    // the whole game; on the other three, the winner banks whatever they
+    // hadn't gotten around to taking yet. apiResult()==2 (draw, including
+    // the engine's own turn>=10000/actionCount>=3000 safety valves) adds
+    // no lump sum -- there's no winner to credit.
+    float reward = ConsumeDensePrizeReward(acting_player);
     int result = battle_->state.apiResult();
-    int actor = battle_->state.selectPlayer;
-    if (result != 2) {
-      reward = (result == actor) ? 1.0F : -1.0F;
+    if (result == 0 || result == 1) {
+      float remaining_winner =
+          static_cast<float>(battle_->state.players[result].prize.size()) /
+          PRIZE_SIZE;
+      reward += (acting_player == result) ? remaining_winner : -remaining_winner;
     }
     // Real engine-side finish -- state.finishCheck() has already run
     // (called internally by ApiSelect/data->next()) and set finishReason,
     // so this is the one place a non-zero value is ever recorded.
     finish_reason_ = static_cast<int>(battle_->state.finishReason);
     SyncFromEngine();
-    WriteState(reward);
+    WriteState(reward, acting_player);
   }
 
   std::vector<int> ComputeBypassSelection() {
@@ -420,13 +528,61 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     return indices;
   }
 
+  // Dense per-prize reward ("Reward" in the skill): diffs each player's
+  // remaining prize count (ps.prize.size()) against its value as of the
+  // last call, attributes the net change to `actor` (positive if actor
+  // gained ground, negative if the other player did -- this covers both
+  // "actor's own attack KO'd something" and "actor's own effect handed the
+  // other player a free prize", without needing to know which happened),
+  // and unconditionally advances the baseline. Two cases are a safe no-op
+  // (baseline refreshed, reward stays 0): `actor` outside {0,1} (only the
+  // Reset()-time first call, via ResolveBypassedSelectsThenRespond(-1) in
+  // Reset()), and `state.phase == GamePhase::Setup`.
+  //
+  // The Setup guard is required, not defensive: SetupProc.h's SetupGame ->
+  // SelectedIsFirst presents the very first Python-visible decide() (a
+  // Yes/No "who goes first" prompt) *before* SetupPrize ever runs for
+  // either player -- prev_prize_remaining_'s {PRIZE_SIZE, PRIZE_SIZE}
+  // member-initializer is just a placeholder value, not yet true at that
+  // point. Worse, SetupProc.h's AfterSetupActivePokemon deals a mulligan-
+  // free player's prizes with SetupPrize(state, i) *alone*, one whole
+  // resolution before the other (mulliganing) player's own SetupPrize call
+  // -- an ordinary (no phase guard) delta computation on that resolution
+  // would see one side's remaining jump 0->PRIZE_SIZE with the other still
+  // at 0, i.e. exactly what a real multi-prize KO looks like, producing a
+  // full spurious +-1.0 "reward" for getting your own starting prizes
+  // dealt. state.phase stays GamePhase::Setup for the whole setup
+  // sequence (mulligan/active/bench selection, SetupPrize itself) and only
+  // flips to Main inside TurnStart, right as the first real turn begins
+  // (GameProc.h) -- a reliable "has real gameplay actually started yet"
+  // signal, unlike trying to infer it from prize counts themselves (a
+  // legitimate mid-game effect, EffectType::DeckToPrize, can also
+  // *increase* a prize pile, so "prizes went up" alone doesn't imply
+  // setup).
+  float ConsumeDensePrizeReward(int actor) {
+    const auto& state = battle_->state;
+    std::array<int, 2> cur = {
+        static_cast<int>(state.players[0].prize.size()),
+        static_cast<int>(state.players[1].prize.size()),
+    };
+    float result = 0.0F;
+    if ((actor == 0 || actor == 1) && state.phase != GamePhase::Setup) {
+      int other = 1 - actor;
+      int delta_actor = prev_prize_remaining_[actor] - cur[actor];
+      int delta_other = prev_prize_remaining_[other] - cur[other];
+      result = static_cast<float>(delta_actor - delta_other) / PRIZE_SIZE;
+    }
+    prev_prize_remaining_ = cur;
+    return result;
+  }
+
   void SyncFromEngine() {
     const auto& state = battle_->state;
     current_player_ = state.selectPlayer;
     done_ = state.isFinish();
   }
 
-  void WriteState(float reward) {
+  void WriteState(float reward, int reward_player) {
     auto state = Allocate();
     // Not a free Allocate() default -- StateBuffer's backing arrays are a
     // ring buffer allocated once per AsyncEnvPool and zero-initialized only
@@ -459,6 +615,7 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
                         state["obs:options"_]);
     }
     state["info:current_player"_] = current_player_;
+    state["info:reward_player"_] = reward_player;
     state["info:finish_reason"_] = finish_reason_;
     state["reward"_] = reward;
   }

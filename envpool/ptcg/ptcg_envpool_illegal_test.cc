@@ -115,6 +115,10 @@ TEST(PtcgEnvPoolIllegalTest, IllegalDecideActionPenalizesActor) {
       << "no SyncFromEngine happens on the illegal path -- ApiSelect "
          "returns before calling data->next() on any error (Api.h), so "
          "current_player_ stays exactly what it was announced as";
+  EXPECT_EQ(static_cast<int>(state["info:reward_player"_][0]), actor_before)
+      << "the offender is who submitted this action, so they're who the "
+         "-1.0 penalty belongs to -- acting_player was snapshotted in "
+         "Step() before the illegal check, same value as actor_before here";
   EXPECT_EQ(static_cast<int>(state["info:finish_reason"_][0]), 0)
       << "ApiSelect returned before advancing state, so the engine's own "
          "finishCheck() never ran on this action";
