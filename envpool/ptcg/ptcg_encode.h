@@ -549,6 +549,14 @@ class ObservationEncoder {
       return {1, is_me, pokemon_pos::kNone, card_area::kDiscard, index, id_of(ref)};
     }
     if (area == static_cast<int>(AreaType::Active)) {
+      // Can genuinely be empty: right after a KO, before the mandatory
+      // replacement select resolves, the loser's ps.active has no entries
+      // yet. Degrade gracefully, same pattern as the Looking branch below
+      // (and encode.py's mirror of this same guard), rather than indexing
+      // an empty list.
+      if (ps.active.empty()) {
+        return kNoCardPtr;
+      }
       CardRef ref = ps.active[0];
       return {1, is_me, pokemon_pos::kActive, card_area::kActive, 0, id_of(ref)};
     }
@@ -589,6 +597,10 @@ class ObservationEncoder {
   CardPtr ResolveAttached(int area, int index, int player_index, int sub_index, int kind) {
     int is_me = (player_index == your_index_) ? 1 : 0;
     const auto& ps = state_.players[player_index];
+    // Same genuinely-empty-Active window as ResolveDirect above.
+    if (area == static_cast<int>(AreaType::Active) && ps.active.empty()) {
+      return kNoCardPtr;
+    }
     CardRef pk_ref = (area == static_cast<int>(AreaType::Active)) ? ps.active[0] : ps.bench[index];
     const Card& pk_card = state_.getCard(pk_ref);
     int pos = (area == static_cast<int>(AreaType::Active)) ? pokemon_pos::kActive
