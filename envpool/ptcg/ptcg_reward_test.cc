@@ -219,6 +219,22 @@ TEST(PtcgRewardTest, DenseRewardMatchesObservedPrizeDeltas) {
         // PRIZE_SIZE) without being fragile to which exact finish reason a
         // real, randomly-run game happens to end on.
         EXPECT_LE(std::abs(reward), 3.0F) << "reward=" << reward;
+        // info:prize_p0/p1 are readable ground truth on this exact row
+        // (unlike obs:player_state, which WriteState Zero()'s here) -- a
+        // real Prize0 finish means the winner's own pile hit exactly 0.
+        int prize_p0 = static_cast<int>(state["info:prize_p0"_][0]);
+        int prize_p1 = static_cast<int>(state["info:prize_p1"_][0]);
+        EXPECT_GE(prize_p0, 0);
+        EXPECT_LE(prize_p0, PRIZE_SIZE);
+        EXPECT_GE(prize_p1, 0);
+        EXPECT_LE(prize_p1, PRIZE_SIZE);
+        int finish_reason = static_cast<int>(state["info:finish_reason"_][0]);
+        if (finish_reason == static_cast<int>(FinishReason::Prize0)) {
+          EXPECT_TRUE(prize_p0 == 0 || prize_p1 == 0)
+              << "Prize0 finish but neither player's info:prize_p* hit 0 -- "
+                 "prize_p0="
+              << prize_p0 << " prize_p1=" << prize_p1;
+        }
         break;
       }
 
@@ -323,6 +339,17 @@ TEST(PtcgRewardTest, RoundCapForcesTimeoutAtExactlyMaxRounds) {
   ExpectAllZero(state["obs:state"_][0]);
   ExpectAllZero(state["obs:select"_][0]);
   ExpectAllZero(state["obs:options"_][0]);
+  // Unlike obs:player_state above, info:prize_p0/p1 are NOT Zero()'d on this
+  // terminal row -- they're the whole point of exposing them separately.
+  // This cap is tiny enough that a real game can't have finished by round 5
+  // (kCap+1's ASSERT_FALSE above already established that), so this can't
+  // pin exact values without over-fitting to engine setup-phase timing --
+  // just confirms the fields are wired and in range, not left uninitialized
+  // or leaking a stale ring-buffer slot.
+  EXPECT_GE(static_cast<int>(state["info:prize_p0"_][0]), 0);
+  EXPECT_LE(static_cast<int>(state["info:prize_p0"_][0]), PRIZE_SIZE);
+  EXPECT_GE(static_cast<int>(state["info:prize_p1"_][0]), 0);
+  EXPECT_LE(static_cast<int>(state["info:prize_p1"_][0]), PRIZE_SIZE);
 }
 
 // A dense delta landing exactly on the cap-triggering step still being

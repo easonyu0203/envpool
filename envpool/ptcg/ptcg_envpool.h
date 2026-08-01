@@ -100,7 +100,18 @@ class PtcgEnvFns {
         // env's own round-cap close-out
         // (AutoResolveForcedSubPicksThenRespond), never produced by the
         // engine itself.
-        "info:finish_reason"_.Bind(Spec<int>({}, {kFinishReasonTimeout, 9})));
+        "info:finish_reason"_.Bind(Spec<int>({}, {kFinishReasonTimeout, 9})),
+        // True prize-cards-remaining count for player 0/1 (absolute index,
+        // not ego-relative like obs:player_state's rows) -- valid on EVERY
+        // row, including the terminal one, unlike the 6 encoded obs:
+        // tensors above (Zero()'d when done_, see WriteState). Just
+        // prev_prize_remaining_ plumbed out: ConsumeDensePrizeReward already
+        // refreshes it from live engine state on every call that reaches
+        // it, and the one path that doesn't call it (illegal-action instant
+        // loss) never mutates battle_->state either, so the previous
+        // snapshot is still correct there too.
+        "info:prize_p0"_.Bind(Spec<int>({}, {0, PRIZE_SIZE})),
+        "info:prize_p1"_.Bind(Spec<int>({}, {0, PRIZE_SIZE})));
   }
 
   template <typename Config>
@@ -617,6 +628,8 @@ class PtcgEnv : public Env<PtcgEnvSpec> {
     state["info:current_player"_] = current_player_;
     state["info:reward_player"_] = reward_player;
     state["info:finish_reason"_] = finish_reason_;
+    state["info:prize_p0"_] = prev_prize_remaining_[0];
+    state["info:prize_p1"_] = prev_prize_remaining_[1];
     state["reward"_] = reward;
   }
 };
