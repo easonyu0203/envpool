@@ -21,6 +21,8 @@
 #include <cmath>
 #include <vector>
 
+#include "AddOption.h"
+
 using PtcgAction = typename ptcg::PtcgEnv::Action;
 using PtcgState = typename ptcg::PtcgEnv::State;
 
@@ -163,6 +165,53 @@ int PickLegalAction(const std::vector<int>& options_flat) {
 // Reset() instead of Step(), regardless of what was sent -- confirmed here
 // by continuing to drive every env (including ones that already completed
 // once) until the slowest env finishes its first episode too.
+// GitHub #4 regression: SelectOption::getCardPosition() casts param0 to
+// AreaType with no type gate, but param0 only actually holds an area for
+// some option types -- for Play it's the hand index and for Attack it's the
+// attackId. AreaType::Prize == 6, so an untouched Play(6) or Attack with
+// attackId % 256 == 6 used to misfire as a prize select (IsPrizeSelect
+// true), get bypassed, and get resolved by envpool's own random selection
+// instead of ever reaching the policy -- silently, since picking a random
+// legal option is itself always legal. These bare State objects need no
+// battle/engine setup: IsForcedFullSelect/IsPrizeSelect/IsBypassedSelect
+// only ever read state.options and state.selectMin/selectMax.
+TEST(PtcgEnvPoolTest, IsPrizeSelectIgnoresPlayHandIndexSix) {
+  State state{};
+  state.selectType = SelectType::None;  // anything but Card/AttachedCard -- see State::addOption's gate
+  AddOptionPlay(state, /*index=*/6);
+  EXPECT_FALSE(ptcg::IsPrizeSelect(state));
+  EXPECT_FALSE(ptcg::IsBypassedSelect(state));
+}
+
+TEST(PtcgEnvPoolTest, IsPrizeSelectIgnoresAttackIdSix) {
+  State state{};
+  state.selectType = SelectType::None;
+  AddOptionAttack(state, /*attackId=*/6, /*srcAttackId=*/0);
+  EXPECT_FALSE(ptcg::IsPrizeSelect(state));
+  EXPECT_FALSE(ptcg::IsBypassedSelect(state));
+}
+
+// Every neighboring param0 value must also stay unaffected -- confirms the
+// fix gates on option.type rather than merely special-casing 6.
+TEST(PtcgEnvPoolTest, IsPrizeSelectIgnoresPlayNeighboringHandIndices) {
+  for (int index = 0; index <= 8; ++index) {
+    State state{};
+    state.selectType = SelectType::None;
+    AddOptionPlay(state, index);
+    EXPECT_FALSE(ptcg::IsPrizeSelect(state)) << "hand index=" << index;
+  }
+}
+
+// A genuine prize select (Card-type option whose area really is Prize) must
+// still be detected -- the fix narrows the check, it must not blind it.
+TEST(PtcgEnvPoolTest, IsPrizeSelectStillDetectsRealPrizeSelect) {
+  State state{};
+  state.selectType = SelectType::Card;
+  AddOptionCard(state, AreaType::Prize, /*index=*/0, /*playerIndex=*/0);
+  EXPECT_TRUE(ptcg::IsPrizeSelect(state));
+  EXPECT_TRUE(ptcg::IsBypassedSelect(state));
+}
+
 TEST(PtcgEnvPoolTest, RealEngineEndToEnd) {
   auto config = ptcg::PtcgEnvSpec::kDefaultConfig;
   const int num_envs = 3;

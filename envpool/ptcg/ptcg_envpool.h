@@ -138,9 +138,34 @@ inline bool IsForcedFullSelect(const State& state) {
          state.selectMax == static_cast<int>(state.options.size());
 }
 
+// GitHub #4: SelectOption::getCardPosition() casts param0 to AreaType with
+// no type gate, but param0 only actually holds an area for the option types
+// listed below (mirroring ApiJson.h's own list of types that emit an
+// "area" key) -- for every other type param0 holds something else entirely
+// (e.g. Play's hand index, Attack's attackId), and since AreaType::Prize
+// == 6, an unrelated Play(6) or Attack(attackId % 256 == 6) option would
+// otherwise misfire as a prize select and get silently resolved by
+// envpool's own random bypass instead of reaching the policy. Gate on
+// option.type first, exactly like every other engine call site that reads
+// getCardPosition() already does.
 inline bool IsPrizeSelect(const State& state) {
-  return !state.options.empty() &&
-         state.options[0].getCardPosition().area == AreaType::Prize;
+  if (state.options.empty()) {
+    return false;
+  }
+  const SelectOption& o = state.options[0];
+  switch (o.type) {
+    case SelectOptionType::Card:
+    case SelectOptionType::ToolCard:
+    case SelectOptionType::EnergyCard:
+    case SelectOptionType::Energy:
+    case SelectOptionType::Attach:
+    case SelectOptionType::Evolve:
+    case SelectOptionType::Ability:
+    case SelectOptionType::Discard:
+      return static_cast<AreaType>(o.param0) == AreaType::Prize;
+    default:
+      return false;
+  }
 }
 
 inline bool IsBypassedSelect(const State& state) {
