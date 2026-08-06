@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <mutex>
 #include <string>
 
 using PtcgAction = typename ptcg::PtcgEnv::Action;
@@ -369,4 +370,93 @@ TEST(PtcgEncodeTest, StructuralInvariantsOnRealDecideSteps) {
   // Sanity: this test is only meaningful if it actually exercised the
   // encoder on real decide() steps, not just deck-select/terminal ones.
   EXPECT_GT(total_checked, 0);
+}
+
+// Regression test for a real crash, fixed by envpool commit 71ea6aa
+// (mirrored in the main repo's encode.py by commit 8fd9c09): a player's
+// Active can be genuinely empty right after a KO, before the mandatory
+// replacement select resolves. ResolveDirect/ResolveAttached both indexed
+// ps.active[0] unconditionally for AreaType::Active, throwing an uncaught
+// exception the instant training-scale self-play hit this window (rare
+// enough to never fire in earlier single-game testing). No regression test
+// existed for either the C++ or Python fix until now. Real self-play can't
+// reliably coerce this window inside a fast unit test, so this drives a
+// real battle to its first genuine decision, then directly forces player
+// 0's Active empty and swaps in a Card option (ResolveDirect) and an
+// EnergyCard option (ResolveAttached, a separate code path) pointed at
+// AreaType::Active for that player -- both must degrade to an invalid card
+// pointer, not crash.
+TEST(PtcgEncodeTest, EmptyActivePointerDegradesGracefully) {
+  // InitializeAll() must run exactly once per *process*, not once per test
+  // (see PtcgEnv's ctor for the canonical guard) -- this binary's other
+  // test above already triggers it via PtcgEnvPool's own internal
+  // once_flag. A second, independent std::call_once/InitializeAll here
+  // (this test's original form) double-initializes the engine's global
+  // tables and corrupts them (caught the hard way: a `FixedList<int, 7>`
+  // fills past capacity deep inside an unrelated later call). Constructing
+  // a throwaway PtcgEnvPool instead reuses that same safe, process-wide
+  // guard regardless of which test in this binary runs first.
+  {
+    auto config = ptcg::PtcgEnvSpec::kDefaultConfig;
+    config["num_envs"_] = 1;
+    config["batch_size"_] = 1;
+    config["num_threads"_] = 1;
+    config["deck0s"_] = TileDeck(kDeck, 1);
+    config["deck1s"_] = TileDeck(kDeck, 1);
+    ptcg::PtcgEnvSpec spec(config);
+    ptcg::PtcgEnvPool warmup(spec);
+  }
+
+  std::array<int, 2 * 60> cards{};
+  std::copy(kDeck.begin(), kDeck.end(), cards.begin());
+  std::copy(kDeck.begin(), kDeck.end(), cards.begin() + 60);
+  StartData start = ApiBattleStart(cards.data());
+  ASSERT_NE(start.battlePtr, nullptr)
+      << "errorPlayer=" << start.errorPlayer << " errorType=" << start.errorType;
+  ApiData* battle = start.battlePtr;
+  battle->game.config.deviceRand = false;
+
+  State& state = battle->state;
+  ASSERT_FALSE(state.options.empty()) << "no real decision at battle start";
+
+  // Force the genuinely-empty-Active window directly rather than trying to
+  // coerce the engine into a real post-KO state, and replace the real
+  // options with two synthetic ones that resolve straight through
+  // ResolveDirect/ResolveAttached's AreaType::Active branch.
+  state.players[0].active.clear();
+  state.options.clear();
+  SelectOption card_opt{};
+  card_opt.type = SelectOptionType::Card;
+  card_opt.param0 = static_cast<short>(AreaType::Active);
+  card_opt.param1 = 0;  // index
+  card_opt.param2 = 0;  // playerIndex
+  state.options.push_back(card_opt);
+  SelectOption energy_opt{};
+  energy_opt.type = SelectOptionType::EnergyCard;
+  energy_opt.param0 = static_cast<short>(AreaType::Active);
+  energy_opt.param1 = 0;  // index
+  energy_opt.param2 = 0;  // playerIndex
+  energy_opt.param3 = 0;  // energyIndex
+  state.options.push_back(energy_opt);
+  state.selectMin = 0;
+  state.selectMax = static_cast<int>(state.options.size());
+
+  Array cards_arr(Spec<int>({ptcg::kMaxCards, ptcg::kCardsCols}));
+  Array pokemons_arr(Spec<int>({ptcg::kMaxPokemon, ptcg::kPokemonsCols}));
+  Array player_state_arr(Spec<int>({ptcg::kPlayerStateRows, ptcg::kPlayerStateCols}));
+  Array state_arr(Spec<int>({ptcg::kStateCols}));
+  Array select_arr(Spec<int>({ptcg::kSelectCols}));
+  Array options_arr(Spec<int>({ptcg::kOptionRows, ptcg::kOptionsCols}));
+
+  // Must not crash -- this call is the actual regression check.
+  ptcg::EncodeObservation(state, kDeck, {}, cards_arr, pokemons_arr, player_state_arr,
+                          state_arr, select_arr, options_arr);
+
+  TArray<int> options(options_arr);
+  EXPECT_EQ(Cell(options, 0, options_col::kCardValid), 0)
+      << "ResolveDirect: empty Active must mark the card pointer invalid";
+  EXPECT_EQ(Cell(options, 1, options_col::kCardValid), 0)
+      << "ResolveAttached: empty Active must mark the card pointer invalid";
+
+  ApiBattleFinish(battle);
 }
